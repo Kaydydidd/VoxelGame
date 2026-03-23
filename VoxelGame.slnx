@@ -1,0 +1,11 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Folder Name="/Solution Items/">
+    <File Path="DemoMain.cpp" />
+    <File Path="voxel.cpp" />
+  </Folder>
+  <Project Path="VoxelGame.vcxproj" />
+</Solution>
