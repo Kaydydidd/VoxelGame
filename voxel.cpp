@@ -1,18 +1,12 @@
-#pragma once
-#define NOMINMAX
-#include <windows.h>
+#include "voxel.h"
+
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 
-#include <algorithm>
-#include <chrono>
-#include <cmath>
-#include <cstdint>
+#include <cstring>
 #include <stdexcept>
-#include <string>
-#include <vector>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -20,44 +14,35 @@
 
 using Microsoft::WRL::ComPtr;
 
-constexpr int   MAP_SIZE = 1024; // must stay power-of-two for fast wrapping
-constexpr float PI = 3.1415926535f;
-constexpr UINT  FRAME_COUNT = 2;
-constexpr UINT  CB_ALIGN = 256;
+// ---------------------------------------------------------------------------
+//  Global shared state
+// ---------------------------------------------------------------------------
+AppState gApp;
 
 // ---------------------------------------------------------------------------
-//  Frame constants mirrored in HLSL
+//  Internal constants
+// ---------------------------------------------------------------------------
+static constexpr UINT  FRAME_COUNT = 2;
+static constexpr UINT  CB_ALIGN = 256;
+static constexpr int   WATER_LEVEL = 50;
+
+// ---------------------------------------------------------------------------
+//  Frame constants – must match HLSL layout exactly
 // ---------------------------------------------------------------------------
 struct FrameConstants {
-    float    camX, camY, camZ, angle;
-    uint32_t width, height, mapSize, _pad;
+    float camPos[3];   float _p0;
+    float fwd[3];      float _p1;
+    float right[3];    float _p2;
+    float up[3];       float _p3;
+    uint32_t screenW, screenH, mapSize, mapHeight;
+    float tanHalfFov, maxDist, _p4[2];
 };
+static_assert(sizeof(FrameConstants) <= CB_ALIGN, "CB overflow");
 
 // ---------------------------------------------------------------------------
-//  Application state
+//  File-static D3D12 state
 // ---------------------------------------------------------------------------
-struct AppState {
-    int  width = 1280;
-    int  height = 720;
-    HWND hwnd = nullptr;
-
-    // CPU-side terrain. heightMap kept for camera ground-follow (simulation).
-    // colorMap freed after GPU upload.
-    std::vector<uint8_t>  heightMap;
-    std::vector<uint32_t> colorMap;
-
-    float camX = 512.0f;
-    float camY = 512.0f;
-    float camZ = 90.0f;
-    float angle = 0.0f;
-
-    bool running = true;
-    bool flyMode = false;
-
-    float fpsTimer = 0.0f;
-    int   fpsFrames = 0;
-
-    // --- D3D12 core ---
+static struct GpuState {
     ComPtr<ID3D12Device>              device;
     ComPtr<ID3D12CommandQueue>        queue;
     ComPtr<IDXGISwapChain3>           swapChain;
@@ -68,251 +53,266 @@ struct AppState {
     UINT64                            fenceValues[FRAME_COUNT]{};
     UINT                              frameIndex = 0;
 
-    // --- descriptors ---
-    ComPtr<ID3D12DescriptorHeap> srvHeap;   // t0,t1,u0
+    ComPtr<ID3D12DescriptorHeap> srvHeap;
     UINT                         srvDescSize = 0;
 
-    // --- pipeline ---
     ComPtr<ID3D12RootSignature> rootSig;
     ComPtr<ID3D12PipelineState> pso;
 
-    // --- resources ---
-    ComPtr<ID3D12Resource> heightTex;   // DEFAULT, immutable
-    ComPtr<ID3D12Resource> colorTex;    // DEFAULT, immutable
-    ComPtr<ID3D12Resource> outputTex;   // DEFAULT, UAV, resize-bound
+    ComPtr<ID3D12Resource> blockTex;            // Texture3D  R8_UINT
+    ComPtr<ID3D12Resource> outputTex;           // Texture2D  UAV
     ComPtr<ID3D12Resource> backBuffers[FRAME_COUNT];
-    ComPtr<ID3D12Resource> cbUpload;    // UPLOAD, persistently mapped ring
+    ComPtr<ID3D12Resource> cbUpload;
     uint8_t* cbMapped = nullptr;
-} gApp;
+} gpu;
 
 // ---------------------------------------------------------------------------
 //  Error handling
 // ---------------------------------------------------------------------------
-static inline void Check(HRESULT hr, const char* what) {
-    if (FAILED(hr)) {
-        OutputDebugStringA(what);
-        OutputDebugStringA("\n");
-        throw std::runtime_error(what);
-    }
+static void Check(HRESULT hr, const char* msg) {
+    if (FAILED(hr)) { OutputDebugStringA(msg); throw std::runtime_error(msg); }
 }
 
 // ---------------------------------------------------------------------------
-//  Math / noise  (unchanged – CPU-side terrain authoring only)
+//  Math / noise  (CPU-side terrain authoring)
 // ---------------------------------------------------------------------------
-static inline float Lerp(float a, float b, float t) { return a + (b - a) * t; }
-static inline float Smooth(float t) { return t * t * (3.0f - 2.0f * t); }
+static float Lerp(float a, float b, float t) { return a + (b - a) * t; }
+static float Smooth(float t) { return t * t * (3.0f - 2.0f * t); }
 
-static inline uint32_t MakeColor(uint8_t r, uint8_t g, uint8_t b) {
-    return (uint32_t(r) << 16) | (uint32_t(g) << 8) | uint32_t(b);
-}
-static inline uint8_t ClampByte(int v) {
-    return static_cast<uint8_t>(std::clamp(v, 0, 255));
-}
-
-static inline uint32_t Hash2D(int x, int y) {
+static uint32_t Hash2D(int x, int y) {
     uint32_t h = 2166136261u;
     h = (h ^ uint32_t(x)) * 16777619u;
     h = (h ^ uint32_t(y)) * 16777619u;
-    h ^= (h >> 13);
-    h *= 1274126177u;
-    h ^= (h >> 16);
+    h ^= (h >> 13); h *= 1274126177u; h ^= (h >> 16);
     return h;
 }
-static inline float Random01(int x, int y) {
+static float Random01(int x, int y) {
     return float(Hash2D(x, y) & 0x00FFFFFF) / float(0x00FFFFFF);
 }
 
 float ValueNoise(float x, float y) {
     int x0 = int(std::floor(x)), y0 = int(std::floor(y));
-    int x1 = x0 + 1, y1 = y0 + 1;
-    float sx = Smooth(x - float(x0));
-    float sy = Smooth(y - float(y0));
-    float a = Lerp(Random01(x0, y0), Random01(x1, y0), sx);
-    float b = Lerp(Random01(x0, y1), Random01(x1, y1), sx);
+    float sx = Smooth(x - float(x0)), sy = Smooth(y - float(y0));
+    float a = Lerp(Random01(x0, y0), Random01(x0 + 1, y0), sx);
+    float b = Lerp(Random01(x0, y0 + 1), Random01(x0 + 1, y0 + 1), sx);
     return Lerp(a, b, sy);
 }
 
-float FBM(float x, float y, int octaves = 6) {
+float FBM(float x, float y, int octaves) {
     float sum = 0, amp = 0.5f, freq = 1, norm = 0;
     for (int i = 0; i < octaves; ++i) {
         sum += ValueNoise(x * freq, y * freq) * amp;
-        norm += amp;
-        amp *= 0.5f;
-        freq *= 2.0f;
+        norm += amp; amp *= 0.5f; freq *= 2.0f;
     }
     return sum / norm;
 }
 
-static inline int WrapCoord(int v) { return v & (MAP_SIZE - 1); }
-static inline int MapIndex(int x, int y) {
-    return WrapCoord(y) * MAP_SIZE + WrapCoord(x);
-}
+static int WrapCoord(int v) { return v & (MAP_SIZE - 1); }
 
-// Kept for camera ground-follow (simulation, not rendering).
-static inline uint8_t SampleHeightNearest(float x, float y) {
-    return gApp.heightMap[MapIndex(int(std::floor(x)), int(std::floor(y)))];
+static uint8_t SampleHeightNearest(float wx, float wz) {
+    return gApp.heightMap[WrapCoord(int(std::floor(wz))) * MAP_SIZE
+        + WrapCoord(int(std::floor(wx)))];
 }
 
 // ---------------------------------------------------------------------------
-//  Terrain generation  (unchanged – runs once, CPU authoring)
+//  Terrain generation  (fills 3-D blockMap + 2-D heightMap cache)
 // ---------------------------------------------------------------------------
 void GenerateTerrain() {
-    gApp.heightMap.resize(MAP_SIZE * MAP_SIZE);
-    gApp.colorMap.resize(MAP_SIZE * MAP_SIZE);
+    const size_t totalBlocks = size_t(MAP_SIZE) * MAP_HEIGHT * MAP_SIZE;
+    gApp.blockMap.assign(totalBlocks, BLOCK_AIR);
+    gApp.heightMap.resize(size_t(MAP_SIZE) * MAP_SIZE);
 
-    for (int y = 0; y < MAP_SIZE; ++y) {
+    for (int z = 0; z < MAP_SIZE; ++z) {
         for (int x = 0; x < MAP_SIZE; ++x) {
-            float nx = x * 0.0035f, ny = y * 0.0035f;
-            float large = FBM(x * 0.0012f, y * 0.0012f, 5);
-            float medium = FBM(nx, ny, 6);
-            float detail = FBM(x * 0.012f, y * 0.012f, 4);
+            float nx = x * 0.0035f, nz = z * 0.0035f;
+            float large = FBM(x * 0.0012f, z * 0.0012f, 5);
+            float medium = FBM(nx, nz, 6);
+            float detail = FBM(x * 0.012f, z * 0.012f, 4);
 
             float e = 0.55f * medium + 0.30f * large + 0.15f * detail;
             e = std::pow(e, 1.35f);
 
-            float ridge = std::fabs(FBM(x * 0.006f, y * 0.006f, 5) - 0.5f) * 2.0f;
+            float ridge = std::fabs(FBM(x * 0.006f, z * 0.006f, 5) - 0.5f) * 2.0f;
             float heightF = 20.0f + e * 170.0f + ridge * 18.0f;
+            int   surfH = std::clamp(int(heightF), 0, MAP_HEIGHT - 1);
 
-            int h = std::clamp(int(heightF), 0, 255);
-            gApp.heightMap[y * MAP_SIZE + x] = static_cast<uint8_t>(h);
+            gApp.heightMap[z * MAP_SIZE + x] = static_cast<uint8_t>(surfH);
 
-            uint32_t c;
-            if (h < 42)  c = MakeColor(10, 30, 90);
-            else if (h < 52)  c = MakeColor(20, 70, 140);
-            else if (h < 58)  c = MakeColor(194, 178, 128);
-            else if (h < 95) { int g = 110 + int(detail * 40); c = MakeColor(35, ClampByte(g), 45); }
-            else if (h < 140) { int g = 95 + int(detail * 30); c = MakeColor(50, ClampByte(g), 40); }
-            else if (h < 180) { int r = 95 + int(detail * 35); c = MakeColor(ClampByte(r), ClampByte(r), ClampByte(r - 8)); }
-            else { int s = 220 + int(detail * 25); c = MakeColor(ClampByte(s), ClampByte(s), ClampByte(s)); }
+            // Determine surface block type from the same height-based palette
+            BlockType surfType;
+            if (surfH < 42)  surfType = BLOCK_SAND;
+            else if (surfH < 52)  surfType = BLOCK_SAND;
+            else if (surfH < 58)  surfType = BLOCK_SAND;
+            else if (surfH < 140) surfType = BLOCK_GRASS;
+            else if (surfH < 180) surfType = BLOCK_ROCK;
+            else                  surfType = BLOCK_SNOW;
 
-            gApp.colorMap[y * MAP_SIZE + x] = c;
+            // Fill column
+            for (int y = 0; y <= surfH; ++y) {
+                BlockType bt;
+                if (y < surfH - 4) bt = BLOCK_STONE;
+                else if (y < surfH)     bt = BLOCK_DIRT;
+                else                    bt = surfType;
+                gApp.blockMap[BlockIndex(WrapCoord(x), y, WrapCoord(z))] = bt;
+            }
+
+            // Water fill above solid ground up to water level
+            for (int y = surfH + 1; y <= WATER_LEVEL && y < MAP_HEIGHT; ++y) {
+                gApp.blockMap[BlockIndex(WrapCoord(x), y, WrapCoord(z))] =
+                    (y < 42) ? BLOCK_DEEP_WATER : BLOCK_WATER;
+            }
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-//  HLSL compute shader  – direct transliteration of RenderVoxelTerrain
-//  Integer colour math preserved to match CPU truncation exactly.
+//  HLSL compute shader — 3-D DDA voxel raycaster
 // ---------------------------------------------------------------------------
 static const char* g_shaderSrc = R"(
 cbuffer FrameConstants : register(b0)
 {
-    float  camX, camY, camZ, angle;
-    uint   screenWidth, screenHeight, mapSize, _pad;
+    float3 camPos;    float _p0;
+    float3 camFwd;    float _p1;
+    float3 camRight;  float _p2;
+    float3 camUp;     float _p3;
+    uint   screenW, screenH, mapSize, mapHeight;
+    float  tanHalfFov, maxDist;
+    float2 _p4;
 };
 
-Texture2D<uint>   HeightMap : register(t0); // R8_UINT  0..255
-Texture2D<uint>   ColorMap  : register(t1); // R32_UINT 0x00RRGGBB
-RWTexture2D<float4> Output  : register(u0);
+Texture3D<uint>     BlockMap : register(t0);
+RWTexture2D<float4> Output   : register(u0);
 
-uint  Wrap(int v)            { return uint(v) & (mapSize - 1u); }
-uint  SampleHeight(float x, float y)
-{
-    int ix = int(floor(x)), iy = int(floor(y));
-    return HeightMap.Load(int3(Wrap(ix), Wrap(iy), 0));
-}
-uint  SampleColor(float x, float y)
-{
-    int ix = int(floor(x)), iy = int(floor(y));
-    return ColorMap.Load(int3(Wrap(ix), Wrap(iy), 0));
-}
-uint3 Unpack(uint c) { return uint3((c>>16)&255u, (c>>8)&255u, c&255u); }
+static const int   MAX_STEPS = 512;
+static const float3 FOG_COLOR = float3(0.67, 0.80, 0.92);
 
-uint3 Darken(uint3 c, float f)
-{
-    f = saturate(f);
-    return uint3(uint(float(c.r)*f), uint(float(c.g)*f), uint(float(c.b)*f));
-}
-uint3 ApplyFog(uint3 c, float t)
-{
-    t = saturate(t);
-    const float3 fog = float3(170,205,235);
-    float3 fc = float3(c);
-    return uint3(uint(lerp(fc.r,fog.r,t)),
-                 uint(lerp(fc.g,fog.g,t)),
-                 uint(lerp(fc.b,fog.b,t)));
-}
-float4 ToOut(uint3 c) { return float4(float3(c)/255.0, 1.0); }
+// ---- block colours (linear-ish RGB) ----
+static const float3 bcolors[9] = {
+    float3(0,0,0),                // 0 air
+    float3(0.50, 0.50, 0.50),    // 1 stone
+    float3(0.55, 0.36, 0.18),    // 2 dirt
+    float3(0.30, 0.58, 0.16),    // 3 grass (top)
+    float3(0.76, 0.70, 0.50),    // 4 sand
+    float3(0.15, 0.40, 0.68),    // 5 water
+    float3(0.91, 0.91, 0.96),    // 6 snow
+    float3(0.05, 0.14, 0.38),    // 7 deep water
+    float3(0.42, 0.42, 0.39),    // 8 rock
+};
 
-[numthreads(64,1,1)]
+// face brightness:  +X  -X  +Y(top)  -Y(bottom)  +Z  -Z
+static const float faceBright[6] = { 0.80, 0.80, 1.00, 0.45, 0.65, 0.65 };
+
+uint WrapXZ(int v) { return uint(v) & (mapSize - 1u); }
+
+uint GetBlock(int3 p)
+{
+    if (p.y < 0 || p.y >= (int)mapHeight) return 0u;
+    return BlockMap.Load(int4(WrapXZ(p.x), p.y, WrapXZ(p.z), 0));
+}
+
+uint SimpleHash(int3 p)
+{
+    uint h = uint(p.x) * 374761393u + uint(p.y) * 668265263u + uint(p.z) * 1274126177u;
+    h ^= h >> 13; h *= 1274126177u; h ^= h >> 16;
+    return h;
+}
+
+float3 BlockColor(uint bt, int faceIdx, int3 bp)
+{
+    float3 c = bcolors[bt];
+    // grass: green on top, dirt on sides / bottom
+    if (bt == 3 && faceIdx != 2) c = bcolors[2];
+    // snow: slightly blue on sides
+    if (bt == 6 && faceIdx != 2) c *= float3(0.90, 0.92, 0.98);
+
+    // subtle per-block variation
+    float v = float(SimpleHash(bp) & 255u) / 255.0 * 0.08 - 0.04;
+    c *= (1.0 + v);
+    return c;
+}
+
+[numthreads(8,8,1)]
 void CSMain(uint3 tid : SV_DispatchThreadID)
 {
-    uint x = tid.x;
-    if (x >= screenWidth) return;
+    if (tid.x >= screenW || tid.y >= screenH) return;
 
-    // ---- ClearSky (per-column) ----
-    for (uint sy = 0; sy < screenHeight; ++sy)
-    {
-        float t = float(sy) / float(max(1u, screenHeight - 1u));
-        uint r = uint(lerp(75.0,  185.0, t));
-        uint g = uint(lerp(120.0, 220.0, t));
-        uint b = uint(lerp(185.0, 250.0, t));
-        Output[uint2(x, sy)] = ToOut(uint3(r,g,b));
-    }
+    float aspect = float(screenW) / float(max(1u, screenH));
+    float px = (2.0 * (float(tid.x) + 0.5) / float(screenW) - 1.0) * aspect * tanHalfFov;
+    float py = (1.0 - 2.0 * (float(tid.y) + 0.5) / float(screenH)) * tanHalfFov;
 
-    int columnTop = int(screenHeight) - 1;
+    float3 rd = normalize(camFwd + camRight * px + camUp * py);
 
-    const float horizon         = float(screenHeight) * 0.55f;
-    const float tanHalfFov      = 0.95f;
-    const float maxDistance     = 800.0f;
-    const float projectionScale = 260.0f;
+    // ---- 3-D DDA setup ----
+    int3  mapPos = int3(floor(camPos));
+    int3  step   = int3(rd.x >= 0 ? 1 : -1,
+                        rd.y >= 0 ? 1 : -1,
+                        rd.z >= 0 ? 1 : -1);
+    float3 tDelta = abs(1.0 / rd);
+    float3 tMax;
+    tMax.x = ((rd.x >= 0) ? (float(mapPos.x + 1) - camPos.x)
+                           : (camPos.x - float(mapPos.x))) * tDelta.x;
+    tMax.y = ((rd.y >= 0) ? (float(mapPos.y + 1) - camPos.y)
+                           : (camPos.y - float(mapPos.y))) * tDelta.y;
+    tMax.z = ((rd.z >= 0) ? (float(mapPos.z + 1) - camPos.z)
+                           : (camPos.z - float(mapPos.z))) * tDelta.z;
 
-    float sinA = sin(angle);
-    float cosA = cos(angle);
-
-    float zStep = 1.0f;
+    float dist     = 0;
+    int   faceIdx  = -1;   // 0:+X  1:-X  2:+Y  3:-Y  4:+Z  5:-Z
+    bool  hit      = false;
 
     [loop]
-    for (float z = 1.0f; z < maxDistance; z += zStep)
+    for (int i = 0; i < MAX_STEPS; ++i)
     {
-        float centerX = camX + cosA * z;
-        float centerY = camY + sinA * z;
-        float span    = z * tanHalfFov;
-
-        float leftX  = centerX - sinA * span;
-        float leftY  = centerY + cosA * span;
-        float rightX = centerX + sinA * span;
-        float rightY = centerY - cosA * span;
-
-        float dx = (rightX - leftX) / float(screenWidth);
-        float dy = (rightY - leftY) / float(screenWidth);
-
-        float wx = leftX + dx * float(x);
-        float wy = leftY + dy * float(x);
-
-        float invZ = 1.0f / z;
-        float fog  = z / maxDistance; fog *= fog;
-
-        if (columnTop >= 0)
+        // advance to next voxel boundary
+        if (tMax.x < tMax.y)
         {
-            uint  th = SampleHeight(wx, wy);
-            uint  tc = SampleColor (wx, wy);
-
-            float projY = horizon - ((float(th) - camZ) * projectionScale * invZ);
-            int   scrY  = int(projY);
-
-            if (scrY < columnTop)
-            {
-                uint  nh = SampleHeight(wx + dx, wy + dy);
-                float slope = 0.85f + (float(nh) - float(th)) * 0.01f;
-                slope = clamp(slope, 0.55f, 1.10f);
-
-                uint3 col = Unpack(tc);
-                col = Darken(col, slope);
-                col = ApplyFog(col, fog);
-
-                int yTop = max(scrY, 0);
-                int yBot = min(columnTop, int(screenHeight) - 1);
-                [loop]
-                for (int py = yTop; py <= yBot; ++py)
-                    Output[uint2(x, uint(py))] = ToOut(col);
-
-                columnTop = scrY - 1;
-            }
+            if (tMax.x < tMax.z)
+            { dist = tMax.x; tMax.x += tDelta.x; mapPos.x += step.x;
+              faceIdx = step.x > 0 ? 1 : 0; }
+            else
+            { dist = tMax.z; tMax.z += tDelta.z; mapPos.z += step.z;
+              faceIdx = step.z > 0 ? 5 : 4; }
+        }
+        else
+        {
+            if (tMax.y < tMax.z)
+            { dist = tMax.y; tMax.y += tDelta.y; mapPos.y += step.y;
+              faceIdx = step.y > 0 ? 3 : 2; }
+            else
+            { dist = tMax.z; tMax.z += tDelta.z; mapPos.z += step.z;
+              faceIdx = step.z > 0 ? 5 : 4; }
         }
 
-        zStep += 0.0065f;
+        if (dist > maxDist) break;
+        if (mapPos.y < 0) break;
+        if (mapPos.y >= (int)mapHeight) continue;
+
+        uint bt = GetBlock(mapPos);
+        if (bt != 0u) { hit = true; break; }
     }
+
+    float4 color;
+    if (hit)
+    {
+        uint bt = GetBlock(mapPos);
+        float3 c = BlockColor(bt, faceIdx, mapPos);
+        c *= faceBright[faceIdx];
+
+        float fogT = saturate(dist / maxDist);
+        fogT *= fogT;
+        c = lerp(c, FOG_COLOR, fogT);
+        color = float4(c, 1.0);
+    }
+    else
+    {
+        // sky gradient based on ray pitch
+        float t = rd.y * 0.5 + 0.5;
+        float3 lo = float3(0.67, 0.80, 0.92);
+        float3 hi = float3(0.25, 0.45, 0.75);
+        color = float4(lerp(lo, hi, saturate(t)), 1.0);
+    }
+
+    Output[tid.xy] = color;
 }
 )";
 
@@ -320,8 +320,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID)
 //  D3D12 helpers
 // ---------------------------------------------------------------------------
 static D3D12_RESOURCE_BARRIER Transition(ID3D12Resource* r,
-    D3D12_RESOURCE_STATES before,
-    D3D12_RESOURCE_STATES after) {
+    D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
     D3D12_RESOURCE_BARRIER b{};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     b.Transition.pResource = r;
@@ -331,65 +330,26 @@ static D3D12_RESOURCE_BARRIER Transition(ID3D12Resource* r,
     return b;
 }
 
-// ---------------------------------------------------------------------------
-//  GPU synchronisation
-//  Invariant: fenceValues[i] is always the NEXT value to be signalled for
-//  slot i. It is strictly greater than any value already on the fence.
-// ---------------------------------------------------------------------------
 static void WaitForGpu() {
-    // Signal the pending value for this slot, wait for it, then advance so
-    // the stored value is again "next to signal".
-    Check(gApp.queue->Signal(gApp.fence.Get(), gApp.fenceValues[gApp.frameIndex]), "Signal");
-
-    if (gApp.fence->GetCompletedValue() < gApp.fenceValues[gApp.frameIndex]) {
-        Check(gApp.fence->SetEventOnCompletion(gApp.fenceValues[gApp.frameIndex],
-            gApp.fenceEvent), "SetEvent");
-        WaitForSingleObject(gApp.fenceEvent, INFINITE);
+    Check(gpu.queue->Signal(gpu.fence.Get(), gpu.fenceValues[gpu.frameIndex]), "Signal");
+    if (gpu.fence->GetCompletedValue() < gpu.fenceValues[gpu.frameIndex]) {
+        Check(gpu.fence->SetEventOnCompletion(gpu.fenceValues[gpu.frameIndex],
+            gpu.fenceEvent), "SetEvent");
+        WaitForSingleObject(gpu.fenceEvent, INFINITE);
     }
-
-    // Confirmed: all prior GPU work complete. Advance for next use.
-    gApp.fenceValues[gApp.frameIndex]++;
+    gpu.fenceValues[gpu.frameIndex]++;
 }
 
 static void MoveToNextFrame() {
-    // Schedule a signal marking completion of the frame just submitted.
-    const UINT64 submitted = gApp.fenceValues[gApp.frameIndex];
-    Check(gApp.queue->Signal(gApp.fence.Get(), submitted), "Signal");
-
-    // Advance to the next swap-chain slot.
-    gApp.frameIndex = gApp.swapChain->GetCurrentBackBufferIndex();
-
-    // Confirm the PREVIOUS occupant of this slot has finished before we
-    // recycle its command allocator / CB region / back buffer.
-    if (gApp.fence->GetCompletedValue() < gApp.fenceValues[gApp.frameIndex]) {
-        Check(gApp.fence->SetEventOnCompletion(gApp.fenceValues[gApp.frameIndex],
-            gApp.fenceEvent), "SetEvent");
-        WaitForSingleObject(gApp.fenceEvent, INFINITE);
+    const UINT64 submitted = gpu.fenceValues[gpu.frameIndex];
+    Check(gpu.queue->Signal(gpu.fence.Get(), submitted), "Signal");
+    gpu.frameIndex = gpu.swapChain->GetCurrentBackBufferIndex();
+    if (gpu.fence->GetCompletedValue() < gpu.fenceValues[gpu.frameIndex]) {
+        Check(gpu.fence->SetEventOnCompletion(gpu.fenceValues[gpu.frameIndex],
+            gpu.fenceEvent), "SetEvent");
+        WaitForSingleObject(gpu.fenceEvent, INFINITE);
     }
-
-    // Reserve the next value for this slot's upcoming submission.
-    gApp.fenceValues[gApp.frameIndex] = submitted + 1;
-}
-
-static ComPtr<ID3D12Resource> CreateDefaultTex2D(DXGI_FORMAT fmt, UINT w, UINT h,
-    D3D12_RESOURCE_FLAGS flags,
-    D3D12_RESOURCE_STATES initState) {
-    D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-    D3D12_RESOURCE_DESC rd{};
-    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    rd.Width = w;
-    rd.Height = h;
-    rd.DepthOrArraySize = 1;
-    rd.MipLevels = 1;
-    rd.Format = fmt;
-    rd.SampleDesc.Count = 1;
-    rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    rd.Flags = flags;
-    ComPtr<ID3D12Resource> res;
-    Check(gApp.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-        initState, nullptr, IID_PPV_ARGS(&res)),
-        "CreateDefaultTex2D");
-    return res;
+    gpu.fenceValues[gpu.frameIndex] = submitted + 1;
 }
 
 static ComPtr<ID3D12Resource> CreateUploadBuffer(UINT64 size) {
@@ -404,28 +364,67 @@ static ComPtr<ID3D12Resource> CreateUploadBuffer(UINT64 size) {
     rd.SampleDesc.Count = 1;
     rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     ComPtr<ID3D12Resource> res;
-    Check(gApp.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-        IID_PPV_ARGS(&res)),
+    Check(gpu.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&res)),
         "CreateUploadBuffer");
     return res;
 }
 
-// Upload a tightly-packed CPU image into a DEFAULT texture via staging.
-static void UploadTexture(ID3D12GraphicsCommandList* cl,
+static ComPtr<ID3D12Resource> CreateDefaultTex2D(DXGI_FORMAT fmt, UINT w, UINT h,
+    D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state) {
+    D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = w; rd.Height = h;
+    rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+    rd.Format = fmt;
+    rd.SampleDesc.Count = 1;
+    rd.Flags = flags;
+    ComPtr<ID3D12Resource> res;
+    Check(gpu.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+        state, nullptr, IID_PPV_ARGS(&res)), "CreateTex2D");
+    return res;
+}
+
+static ComPtr<ID3D12Resource> CreateDefaultTex3D(DXGI_FORMAT fmt,
+    UINT w, UINT h, UINT d,
+    D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state) {
+    D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    rd.Width = w; rd.Height = h;
+    rd.DepthOrArraySize = static_cast<UINT16>(d);
+    rd.MipLevels = 1;
+    rd.Format = fmt;
+    rd.SampleDesc.Count = 1;
+    rd.Flags = flags;
+    ComPtr<ID3D12Resource> res;
+    Check(gpu.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+        state, nullptr, IID_PPV_ARGS(&res)), "CreateTex3D");
+    return res;
+}
+
+// Upload tightly-packed CPU data into a DEFAULT Texture3D via staging.
+static void UploadTexture3D(ID3D12GraphicsCommandList* cl,
     ID3D12Resource* dst, DXGI_FORMAT fmt,
-    const void* src, UINT w, UINT h, UINT texelBytes,
+    const void* src, UINT w, UINT h, UINT d, UINT texelBytes,
     ComPtr<ID3D12Resource>& outStaging) {
-    const UINT rowPitch = (w * texelBytes + 255) & ~255u; // 256-byte row alignment
-    const UINT64 totalSize = UINT64(rowPitch) * h;
+
+    const UINT   rowPitch = (w * texelBytes + 255u) & ~255u;
+    const UINT64 slicePitch = UINT64(rowPitch) * h;
+    const UINT64 totalSize = slicePitch * d;
 
     outStaging = CreateUploadBuffer(totalSize);
 
     uint8_t* mapped = nullptr;
-    Check(outStaging->Map(0, nullptr, reinterpret_cast<void**>(&mapped)), "Map staging");
+    Check(outStaging->Map(0, nullptr, reinterpret_cast<void**>(&mapped)), "Map3D");
     const uint8_t* s = static_cast<const uint8_t*>(src);
-    for (UINT row = 0; row < h; ++row)
-        memcpy(mapped + row * rowPitch, s + row * w * texelBytes, size_t(w) * texelBytes);
+    const UINT srcRow = w * texelBytes;
+    for (UINT z = 0; z < d; ++z)
+        for (UINT y = 0; y < h; ++y)
+            memcpy(mapped + z * slicePitch + y * rowPitch,
+                s + (size_t(z) * h + y) * srcRow,
+                srcRow);
     outStaging->Unmap(0, nullptr);
 
     D3D12_TEXTURE_COPY_LOCATION dstLoc{};
@@ -439,54 +438,46 @@ static void UploadTexture(ID3D12GraphicsCommandList* cl,
     srcLoc.PlacedFootprint.Footprint.Format = fmt;
     srcLoc.PlacedFootprint.Footprint.Width = w;
     srcLoc.PlacedFootprint.Footprint.Height = h;
-    srcLoc.PlacedFootprint.Footprint.Depth = 1;
+    srcLoc.PlacedFootprint.Footprint.Depth = d;
     srcLoc.PlacedFootprint.Footprint.RowPitch = rowPitch;
 
     cl->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
 }
 
 // ---------------------------------------------------------------------------
-//  Size-dependent resources  (output UAV + swap-chain buffers)
+//  Size-dependent resources
 // ---------------------------------------------------------------------------
-void CreateSizeDependentResources() {
-    // Output UAV texture
-    gApp.outputTex = CreateDefaultTex2D(DXGI_FORMAT_R8G8B8A8_UNORM,
+static void CreateSizeDependentResources() {
+    gpu.outputTex = CreateDefaultTex2D(DXGI_FORMAT_R8G8B8A8_UNORM,
         gApp.width, gApp.height,
         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
-    // UAV descriptor at heap slot 2
-    D3D12_CPU_DESCRIPTOR_HANDLE h = gApp.srvHeap->GetCPUDescriptorHandleForHeapStart();
-    h.ptr += 2 * gApp.srvDescSize;
+    // UAV at heap slot 1
+    D3D12_CPU_DESCRIPTOR_HANDLE h = gpu.srvHeap->GetCPUDescriptorHandleForHeapStart();
+    h.ptr += 1 * gpu.srvDescSize;
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
     uav.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    gApp.device->CreateUnorderedAccessView(gApp.outputTex.Get(), nullptr, &uav, h);
+    gpu.device->CreateUnorderedAccessView(gpu.outputTex.Get(), nullptr, &uav, h);
 
-    // Back buffers
     for (UINT i = 0; i < FRAME_COUNT; ++i)
-        Check(gApp.swapChain->GetBuffer(i, IID_PPV_ARGS(&gApp.backBuffers[i])), "GetBuffer");
+        Check(gpu.swapChain->GetBuffer(i, IID_PPV_ARGS(&gpu.backBuffers[i])), "GetBuffer");
 }
 
 void ResizeBackbuffer(int width, int height) {
-    if (!gApp.device) { gApp.width = width; gApp.height = height; return; }
-
+    if (!gpu.device) { gApp.width = width; gApp.height = height; return; }
     WaitForGpu();
-
     for (UINT i = 0; i < FRAME_COUNT; ++i) {
-        gApp.backBuffers[i].Reset();
-        gApp.fenceValues[i] = gApp.fenceValues[gApp.frameIndex];
+        gpu.backBuffers[i].Reset();
+        gpu.fenceValues[i] = gpu.fenceValues[gpu.frameIndex];
     }
-    gApp.outputTex.Reset();
-
+    gpu.outputTex.Reset();
     gApp.width = std::max(1, width);
     gApp.height = std::max(1, height);
-
-    Check(gApp.swapChain->ResizeBuffers(FRAME_COUNT, gApp.width, gApp.height,
-        DXGI_FORMAT_R8G8B8A8_UNORM, 0),
-        "ResizeBuffers");
-    gApp.frameIndex = gApp.swapChain->GetCurrentBackBufferIndex();
-
+    Check(gpu.swapChain->ResizeBuffers(FRAME_COUNT, gApp.width, gApp.height,
+        DXGI_FORMAT_R8G8B8A8_UNORM, 0), "Resize");
+    gpu.frameIndex = gpu.swapChain->GetCurrentBackBufferIndex();
     CreateSizeDependentResources();
 }
 
@@ -504,12 +495,12 @@ void InitD3D12(HWND hwnd) {
 #endif
 
     ComPtr<IDXGIFactory4> factory;
-    Check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "CreateDXGIFactory1");
-    Check(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&gApp.device)),
-        "D3D12CreateDevice");
+    Check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "Factory");
+    Check(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0,
+        IID_PPV_ARGS(&gpu.device)), "Device");
 
     D3D12_COMMAND_QUEUE_DESC qd{}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    Check(gApp.device->CreateCommandQueue(&qd, IID_PPV_ARGS(&gApp.queue)), "CreateQueue");
+    Check(gpu.device->CreateCommandQueue(&qd, IID_PPV_ARGS(&gpu.queue)), "Queue");
 
     DXGI_SWAP_CHAIN_DESC1 scd{};
     scd.BufferCount = FRAME_COUNT;
@@ -520,41 +511,42 @@ void InitD3D12(HWND hwnd) {
     scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     scd.SampleDesc.Count = 1;
     ComPtr<IDXGISwapChain1> sc1;
-    Check(factory->CreateSwapChainForHwnd(gApp.queue.Get(), hwnd, &scd, nullptr, nullptr, &sc1),
-        "CreateSwapChain");
-    Check(sc1.As(&gApp.swapChain), "QI SwapChain3");
-    gApp.frameIndex = gApp.swapChain->GetCurrentBackBufferIndex();
+    Check(factory->CreateSwapChainForHwnd(gpu.queue.Get(), hwnd, &scd,
+        nullptr, nullptr, &sc1), "SwapChain");
+    Check(sc1.As(&gpu.swapChain), "QI SC3");
+    gpu.frameIndex = gpu.swapChain->GetCurrentBackBufferIndex();
 
-    // Descriptor heap: [0]=height SRV, [1]=color SRV, [2]=output UAV
+    // Descriptor heap: [0]=block SRV, [1]=output UAV
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
-    hd.NumDescriptors = 3;
+    hd.NumDescriptors = 2;
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    Check(gApp.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&gApp.srvHeap)), "CreateHeap");
-    gApp.srvDescSize = gApp.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    Check(gpu.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&gpu.srvHeap)), "Heap");
+    gpu.srvDescSize = gpu.device->GetDescriptorHandleIncrementSize(
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
     for (UINT i = 0; i < FRAME_COUNT; ++i)
-        Check(gApp.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-            IID_PPV_ARGS(&gApp.cmdAlloc[i])), "CreateAllocator");
+        Check(gpu.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+            IID_PPV_ARGS(&gpu.cmdAlloc[i])), "Alloc");
 
-    Check(gApp.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
-        gApp.cmdAlloc[0].Get(), nullptr, IID_PPV_ARGS(&gApp.cmdList)), "CreateCmdList");
+    Check(gpu.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+        gpu.cmdAlloc[0].Get(), nullptr, IID_PPV_ARGS(&gpu.cmdList)), "CmdList");
 
-    Check(gApp.device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
-        IID_PPV_ARGS(&gApp.fence)), "CreateFence");
-    gApp.fenceValues[gApp.frameIndex] = 1;          // first value to signal
-    gApp.fenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    Check(gpu.device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+        IID_PPV_ARGS(&gpu.fence)), "Fence");
+    gpu.fenceValues[gpu.frameIndex] = 1;
+    gpu.fenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
 
-    // --- Root signature: [0]=root CBV b0, [1]=table {t0,t1,u0} ---
+    // ---- Root signature: [0] root CBV b0, [1] table {t0, u0} ----
     D3D12_DESCRIPTOR_RANGE ranges[2]{};
     ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    ranges[0].NumDescriptors = 2;
+    ranges[0].NumDescriptors = 1;
     ranges[0].BaseShaderRegister = 0;
     ranges[0].OffsetInDescriptorsFromTableStart = 0;
     ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
     ranges[1].NumDescriptors = 1;
     ranges[1].BaseShaderRegister = 0;
-    ranges[1].OffsetInDescriptorsFromTableStart = 2;
+    ranges[1].OffsetInDescriptorsFromTableStart = 1;
 
     D3D12_ROOT_PARAMETER params[2]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -570,157 +562,211 @@ void InitD3D12(HWND hwnd) {
     rsd.pParameters = params;
 
     ComPtr<ID3DBlob> sig, err;
-    Check(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err), "SerializeRS");
-    Check(gApp.device->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(),
-        IID_PPV_ARGS(&gApp.rootSig)), "CreateRS");
+    Check(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1,
+        &sig, &err), "SerializeRS");
+    Check(gpu.device->CreateRootSignature(0, sig->GetBufferPointer(),
+        sig->GetBufferSize(), IID_PPV_ARGS(&gpu.rootSig)), "RS");
 
-    // --- Compile compute shader ---
+    // ---- Compile compute shader ----
     ComPtr<ID3DBlob> cs;
-    Check(D3DCompile(g_shaderSrc, strlen(g_shaderSrc), nullptr, nullptr, nullptr,
-        "CSMain", "cs_5_1", 0, 0, &cs, &err), "CompileCS");
+    HRESULT hr = D3DCompile(g_shaderSrc, strlen(g_shaderSrc), nullptr, nullptr, nullptr,
+        "CSMain", "cs_5_1", 0, 0, &cs, &err);
+    if (FAILED(hr)) {
+        if (err) OutputDebugStringA(static_cast<const char*>(err->GetBufferPointer()));
+        Check(hr, "CompileCS");
+    }
 
     D3D12_COMPUTE_PIPELINE_STATE_DESC psd{};
-    psd.pRootSignature = gApp.rootSig.Get();
+    psd.pRootSignature = gpu.rootSig.Get();
     psd.CS = { cs->GetBufferPointer(), cs->GetBufferSize() };
-    Check(gApp.device->CreateComputePipelineState(&psd, IID_PPV_ARGS(&gApp.pso)), "CreatePSO");
+    Check(gpu.device->CreateComputePipelineState(&psd, IID_PPV_ARGS(&gpu.pso)), "PSO");
 
-    // --- Constant buffer (UPLOAD, ring, persistently mapped) ---
-    gApp.cbUpload = CreateUploadBuffer(FRAME_COUNT * CB_ALIGN);
-    Check(gApp.cbUpload->Map(0, nullptr, reinterpret_cast<void**>(&gApp.cbMapped)), "Map CB");
+    // ---- Constant buffer ring ----
+    gpu.cbUpload = CreateUploadBuffer(FRAME_COUNT * CB_ALIGN);
+    Check(gpu.cbUpload->Map(0, nullptr, reinterpret_cast<void**>(&gpu.cbMapped)), "MapCB");
 
-    // --- Terrain textures (DEFAULT, immutable) ---
-    gApp.heightTex = CreateDefaultTex2D(DXGI_FORMAT_R8_UINT, MAP_SIZE, MAP_SIZE,
+    // ---- Block texture (Texture3D R8_UINT) ----
+    gpu.blockTex = CreateDefaultTex3D(DXGI_FORMAT_R8_UINT,
+        MAP_SIZE, MAP_HEIGHT, MAP_SIZE,
         D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
-    gApp.colorTex = CreateDefaultTex2D(DXGI_FORMAT_R32_UINT, MAP_SIZE, MAP_SIZE,
-        D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
 
-    ComPtr<ID3D12Resource> stagingH, stagingC;
-    UploadTexture(gApp.cmdList.Get(), gApp.heightTex.Get(), DXGI_FORMAT_R8_UINT,
-        gApp.heightMap.data(), MAP_SIZE, MAP_SIZE, 1, stagingH);
-    UploadTexture(gApp.cmdList.Get(), gApp.colorTex.Get(), DXGI_FORMAT_R32_UINT,
-        gApp.colorMap.data(), MAP_SIZE, MAP_SIZE, 4, stagingC);
+    ComPtr<ID3D12Resource> staging;
+    UploadTexture3D(gpu.cmdList.Get(), gpu.blockTex.Get(), DXGI_FORMAT_R8_UINT,
+        gApp.blockMap.data(), MAP_SIZE, MAP_HEIGHT, MAP_SIZE, 1, staging);
 
-    D3D12_RESOURCE_BARRIER toSrv[2] = {
-        Transition(gApp.heightTex.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
-                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-        Transition(gApp.colorTex.Get(),  D3D12_RESOURCE_STATE_COPY_DEST,
-                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
-    };
-    gApp.cmdList->ResourceBarrier(2, toSrv);
-    Check(gApp.cmdList->Close(), "Close upload");
-    ID3D12CommandList* lists[] = { gApp.cmdList.Get() };
-    gApp.queue->ExecuteCommandLists(1, lists);
+    auto bar = Transition(gpu.blockTex.Get(),
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    gpu.cmdList->ResourceBarrier(1, &bar);
+
+    Check(gpu.cmdList->Close(), "Close upload");
+    ID3D12CommandList* lists[] = { gpu.cmdList.Get() };
+    gpu.queue->ExecuteCommandLists(1, lists);
     WaitForGpu();
-    // Staging buffers released here by ComPtr dtor. CPU colorMap no longer needed.
-    gApp.colorMap.clear(); gApp.colorMap.shrink_to_fit();
+    // staging released here; blockMap kept for future CPU-side block edits
 
-    // --- SRVs ---
-    D3D12_CPU_DESCRIPTOR_HANDLE h = gApp.srvHeap->GetCPUDescriptorHandleForHeapStart();
+    // ---- SRV for block texture (heap slot 0) ----
+    D3D12_CPU_DESCRIPTOR_HANDLE srvH = gpu.srvHeap->GetCPUDescriptorHandleForHeapStart();
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    srv.Texture2D.MipLevels = 1;
     srv.Format = DXGI_FORMAT_R8_UINT;
-    gApp.device->CreateShaderResourceView(gApp.heightTex.Get(), &srv, h);
-    h.ptr += gApp.srvDescSize;
-    srv.Format = DXGI_FORMAT_R32_UINT;
-    gApp.device->CreateShaderResourceView(gApp.colorTex.Get(), &srv, h);
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture3D.MipLevels = 1;
+    gpu.device->CreateShaderResourceView(gpu.blockTex.Get(), &srv, srvH);
 
     CreateSizeDependentResources();
 }
 
 // ---------------------------------------------------------------------------
-//  Per-frame render  (CPU: command recording only)
+//  Per-frame render
 // ---------------------------------------------------------------------------
 void Render() {
-    auto* alloc = gApp.cmdAlloc[gApp.frameIndex].Get();
-    Check(alloc->Reset(), "Alloc Reset");
-    Check(gApp.cmdList->Reset(alloc, gApp.pso.Get()), "List Reset");
+    auto* alloc = gpu.cmdAlloc[gpu.frameIndex].Get();
+    Check(alloc->Reset(), "AllocReset");
+    Check(gpu.cmdList->Reset(alloc, gpu.pso.Get()), "ListReset");
 
-    // Update ring constant buffer slot
-    FrameConstants fc{ gApp.camX, gApp.camY, gApp.camZ, gApp.angle,
-                       UINT(gApp.width), UINT(gApp.height), UINT(MAP_SIZE), 0 };
-    memcpy(gApp.cbMapped + gApp.frameIndex * CB_ALIGN, &fc, sizeof(fc));
+    // Build camera basis on CPU
+    float cosP = std::cos(gApp.pitch), sinP = std::sin(gApp.pitch);
+    float cosA = std::cos(gApp.angle), sinA = std::sin(gApp.angle);
 
-    gApp.cmdList->SetComputeRootSignature(gApp.rootSig.Get());
-    ID3D12DescriptorHeap* heaps[] = { gApp.srvHeap.Get() };
-    gApp.cmdList->SetDescriptorHeaps(1, heaps);
-    gApp.cmdList->SetComputeRootConstantBufferView(0,
-        gApp.cbUpload->GetGPUVirtualAddress() + gApp.frameIndex * CB_ALIGN);
-    gApp.cmdList->SetComputeRootDescriptorTable(1,
-        gApp.srvHeap->GetGPUDescriptorHandleForHeapStart());
+    FrameConstants fc{};
+    // World coords: X = gApp.camX,  Y(up) = gApp.camZ,  Z = gApp.camY
+    fc.camPos[0] = gApp.camX;
+    fc.camPos[1] = gApp.camZ;
+    fc.camPos[2] = gApp.camY;
+    fc.fwd[0] = cosP * cosA;
+    fc.fwd[1] = sinP;
+    fc.fwd[2] = cosP * sinA;
+    fc.right[0] = -sinA;
+    fc.right[1] = 0.0f;
+    fc.right[2] = cosA;
+    // up = cross(right, forward)
+    fc.up[0] = -sinP * cosA;
+    fc.up[1] = cosP;
+    fc.up[2] = -sinP * sinA;
+    fc.screenW = UINT(gApp.width);
+    fc.screenH = UINT(gApp.height);
+    fc.mapSize = UINT(MAP_SIZE);
+    fc.mapHeight = UINT(MAP_HEIGHT);
+    fc.tanHalfFov = 0.8f;
+    fc.maxDist = 300.0f;
 
-    gApp.cmdList->Dispatch((gApp.width + 63) / 64, 1, 1);
+    memcpy(gpu.cbMapped + gpu.frameIndex * CB_ALIGN, &fc, sizeof(fc));
 
-    // output UAV -> COPY_SOURCE,  back buffer PRESENT -> COPY_DEST
+    gpu.cmdList->SetComputeRootSignature(gpu.rootSig.Get());
+    ID3D12DescriptorHeap* heaps[] = { gpu.srvHeap.Get() };
+    gpu.cmdList->SetDescriptorHeaps(1, heaps);
+    gpu.cmdList->SetComputeRootConstantBufferView(0,
+        gpu.cbUpload->GetGPUVirtualAddress() + gpu.frameIndex * CB_ALIGN);
+    gpu.cmdList->SetComputeRootDescriptorTable(1,
+        gpu.srvHeap->GetGPUDescriptorHandleForHeapStart());
+
+    gpu.cmdList->Dispatch((gApp.width + 7) / 8, (gApp.height + 7) / 8, 1);
+
     D3D12_RESOURCE_BARRIER pre[2] = {
-        Transition(gApp.outputTex.Get(),
-                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
-        Transition(gApp.backBuffers[gApp.frameIndex].Get(),
-                   D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)
+        Transition(gpu.outputTex.Get(),
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
+        Transition(gpu.backBuffers[gpu.frameIndex].Get(),
+            D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)
     };
-    gApp.cmdList->ResourceBarrier(2, pre);
-
-    gApp.cmdList->CopyResource(gApp.backBuffers[gApp.frameIndex].Get(), gApp.outputTex.Get());
+    gpu.cmdList->ResourceBarrier(2, pre);
+    gpu.cmdList->CopyResource(gpu.backBuffers[gpu.frameIndex].Get(), gpu.outputTex.Get());
 
     D3D12_RESOURCE_BARRIER post[2] = {
-        Transition(gApp.outputTex.Get(),
-                   D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-        Transition(gApp.backBuffers[gApp.frameIndex].Get(),
-                   D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)
+        Transition(gpu.outputTex.Get(),
+            D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+        Transition(gpu.backBuffers[gpu.frameIndex].Get(),
+            D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)
     };
-    gApp.cmdList->ResourceBarrier(2, post);
+    gpu.cmdList->ResourceBarrier(2, post);
 
-    Check(gApp.cmdList->Close(), "Close");
-    ID3D12CommandList* lists[] = { gApp.cmdList.Get() };
-    gApp.queue->ExecuteCommandLists(1, lists);
-
-    Check(gApp.swapChain->Present(1, 0), "Present");
+    Check(gpu.cmdList->Close(), "Close");
+    ID3D12CommandList* lists[] = { gpu.cmdList.Get() };
+    gpu.queue->ExecuteCommandLists(1, lists);
+    Check(gpu.swapChain->Present(1, 0), "Present");
     MoveToNextFrame();
 }
 
 // ---------------------------------------------------------------------------
-//  Input / camera / window  (unchanged – CPU simulation)
+//  Shutdown
 // ---------------------------------------------------------------------------
-bool KeyDown(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
+void ShutdownD3D12() {
+    if (!gpu.device) return;
+    WaitForGpu();
+    if (gpu.cbMapped) { gpu.cbUpload->Unmap(0, nullptr); gpu.cbMapped = nullptr; }
+    if (gpu.fenceEvent) { CloseHandle(gpu.fenceEvent); gpu.fenceEvent = nullptr; }
+}
 
-void WrapCamera() {
-    while (gApp.camX < 0.0f)               gApp.camX += float(MAP_SIZE);
-    while (gApp.camY < 0.0f)               gApp.camY += float(MAP_SIZE);
-    while (gApp.camX >= float(MAP_SIZE))   gApp.camX -= float(MAP_SIZE);
-    while (gApp.camY >= float(MAP_SIZE))   gApp.camY -= float(MAP_SIZE);
+// ---------------------------------------------------------------------------
+//  Input / camera
+// ---------------------------------------------------------------------------
+static bool KeyDown(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
+
+static void WrapCamera() {
+    while (gApp.camX < 0.0f)             gApp.camX += float(MAP_SIZE);
+    while (gApp.camY < 0.0f)             gApp.camY += float(MAP_SIZE);
+    while (gApp.camX >= float(MAP_SIZE))  gApp.camX -= float(MAP_SIZE);
+    while (gApp.camY >= float(MAP_SIZE))  gApp.camY -= float(MAP_SIZE);
+}
+
+static void CenterCursor() {
+    RECT r; GetClientRect(gApp.hwnd, &r);
+    POINT c = { (r.right - r.left) / 2, (r.bottom - r.top) / 2 };
+    ClientToScreen(gApp.hwnd, &c);
+    SetCursorPos(c.x, c.y);
 }
 
 void UpdateCamera(float dt) {
-    float moveSpeed = 90.0f, strafeSpeed = 75.0f, turnSpeed = 1.7f, liftSpeed = 65.0f;
-    if (KeyDown(VK_SHIFT)) { moveSpeed *= 2; strafeSpeed *= 2; liftSpeed *= 2; }
+    float moveSpeed = 8.0f, strafeSpeed = 7.0f, liftSpeed = 8.0f;
+    if (KeyDown(VK_SHIFT)) { moveSpeed *= 3; strafeSpeed *= 3; liftSpeed *= 3; }
 
-    if (KeyDown(VK_LEFT) || KeyDown('A')) gApp.angle -= turnSpeed * dt;
-    if (KeyDown(VK_RIGHT) || KeyDown('D')) gApp.angle += turnSpeed * dt;
+    // ---- mouse look ----
+    if (gApp.mouseCaptured) {
+        RECT cr; GetClientRect(gApp.hwnd, &cr);
+        POINT center = { (cr.right - cr.left) / 2, (cr.bottom - cr.top) / 2 };
+        POINT screenCenter = center;
+        ClientToScreen(gApp.hwnd, &screenCenter);
 
+        POINT cur; GetCursorPos(&cur);
+        float dx = float(cur.x - screenCenter.x);
+        float dy = float(cur.y - screenCenter.y);
+        const float sens = 0.002f;
+        gApp.angle += dx * sens;
+        gApp.pitch -= dy * sens;
+        gApp.pitch = std::clamp(gApp.pitch, -1.48f, 1.48f);  // ~±85°
+        SetCursorPos(screenCenter.x, screenCenter.y);
+    }
+
+    // ---- keyboard look (fallback) ----
+    if (KeyDown(VK_LEFT))  gApp.angle -= 1.7f * dt;
+    if (KeyDown(VK_RIGHT)) gApp.angle += 1.7f * dt;
+
+    // ---- movement (horizontal, independent of pitch) ----
     float fwd = 0, str = 0;
     if (KeyDown('W') || KeyDown(VK_UP))   fwd += 1;
     if (KeyDown('S') || KeyDown(VK_DOWN)) fwd -= 1;
-    if (KeyDown('Q')) str -= 1;
-    if (KeyDown('E')) str += 1;
+    if (KeyDown('A') || KeyDown('Q'))     str -= 1;
+    if (KeyDown('D') || KeyDown('E'))     str += 1;
 
-    float sinA = std::sin(gApp.angle), cosA = std::cos(gApp.angle);
+    float cosA = std::cos(gApp.angle), sinA = std::sin(gApp.angle);
     gApp.camX += cosA * fwd * moveSpeed * dt;
     gApp.camY += sinA * fwd * moveSpeed * dt;
     gApp.camX += -sinA * str * strafeSpeed * dt;
     gApp.camY += cosA * str * strafeSpeed * dt;
 
+    // ---- vertical / fly ----
     if (KeyDown('T')) gApp.flyMode = true;
     if (KeyDown('G')) gApp.flyMode = false;
 
     if (gApp.flyMode) {
-        if (KeyDown('R')) gApp.camZ += liftSpeed * dt;
-        if (KeyDown('F')) gApp.camZ -= liftSpeed * dt;
+        if (KeyDown(VK_SPACE) || KeyDown('R')) gApp.camZ += liftSpeed * dt;
+        if (KeyDown(VK_CONTROL) || KeyDown('F')) gApp.camZ -= liftSpeed * dt;
     }
     else {
-        float ground = float(SampleHeightNearest(gApp.camX, gApp.camY)) + 18.0f;
+        float surfH = float(SampleHeightNearest(gApp.camX, gApp.camY));
+        float eyeTarget = surfH + 1.0f + 1.5f;   // top-of-block + eye offset
         float follow = std::clamp(dt * 8.0f, 0.0f, 1.0f);
-        gApp.camZ = Lerp(gApp.camZ, ground, follow);
+        gApp.camZ = Lerp(gApp.camZ, eyeTarget, follow);
     }
     WrapCamera();
 }
@@ -729,26 +775,17 @@ void UpdateWindowTitle(HWND hwnd, float dt) {
     gApp.fpsTimer += dt; gApp.fpsFrames++;
     if (gApp.fpsTimer >= 0.5f) {
         float fps = float(gApp.fpsFrames) / gApp.fpsTimer;
-        std::wstring t = L"Scratch Voxel Terrain Renderer | "
-            L"W/S move, A/D turn, Q/E strafe, T fly on, G fly off, R/F vertical | FPS: "
+        std::wstring t = L"Voxel Block Terrain | "
+            L"W/S/A/D move, mouse look, T fly, G walk, Space/Ctrl up/down | FPS: "
             + std::to_wstring(int(fps));
         SetWindowTextW(hwnd, t.c_str());
         gApp.fpsTimer = 0; gApp.fpsFrames = 0;
     }
 }
 
-void ShutdownD3D12() {
-    if (!gApp.device) return;
-
-    // Drain the queue so no in-flight work references resources we're about
-    // to release.
-    WaitForGpu();
-
-    if (gApp.cbMapped) { gApp.cbUpload->Unmap(0, nullptr); gApp.cbMapped = nullptr; }
-    if (gApp.fenceEvent) { CloseHandle(gApp.fenceEvent); gApp.fenceEvent = nullptr; }
-    // ComPtr destructors release the rest in declaration-reverse order.
-}
-
+// ---------------------------------------------------------------------------
+//  Window procedure
+// ---------------------------------------------------------------------------
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_SIZE: {
@@ -756,8 +793,28 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (w > 0 && h > 0) ResizeBackbuffer(w, h);
         return 0;
     }
+    case WM_LBUTTONDOWN:
+        if (!gApp.mouseCaptured) {
+            gApp.mouseCaptured = true;
+            ShowCursor(FALSE);
+            CenterCursor();
+        }
+        return 0;
+    case WM_KEYDOWN:
+        if (wParam == VK_ESCAPE && gApp.mouseCaptured) {
+            gApp.mouseCaptured = false;
+            ShowCursor(TRUE);
+            return 0;
+        }
+        break;
+    case WM_KILLFOCUS:
+        if (gApp.mouseCaptured) {
+            gApp.mouseCaptured = false;
+            ShowCursor(TRUE);
+        }
+        return 0;
     case WM_CLOSE:   DestroyWindow(hwnd); return 0;
     case WM_DESTROY: gApp.running = false; PostQuitMessage(0); return 0;
-    default:         return DefWindowProc(hwnd, msg, wParam, lParam);
     }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
 }
