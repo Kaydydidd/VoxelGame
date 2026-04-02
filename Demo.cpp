@@ -1,5 +1,7 @@
 #define NOMINMAX
 #include <windows.h>
+#include <chrono>
+
 #include "voxel.h"
 
 int RunVoxelTerrainDemo(HINSTANCE hInstance, int nCmdShow);

@@ -5,8 +5,16 @@
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 
+#include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstring>
+#include <deque>
+#include <memory>
 #include <stdexcept>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -14,34 +22,105 @@
 
 using Microsoft::WRL::ComPtr;
 
-// ---------------------------------------------------------------------------
-//  Global shared state
-// ---------------------------------------------------------------------------
 AppState gApp;
 
-// ---------------------------------------------------------------------------
+// ===================================================================
 //  Internal constants
-// ---------------------------------------------------------------------------
+// ===================================================================
 static constexpr UINT  FRAME_COUNT = 2;
 static constexpr UINT  CB_ALIGN = 256;
 static constexpr int   WATER_LEVEL = 50;
 
-// ---------------------------------------------------------------------------
-//  Frame constants – must match HLSL layout exactly
-// ---------------------------------------------------------------------------
-struct FrameConstants {
-    float camPos[3];   float _p0;
-    float fwd[3];      float _p1;
-    float right[3];    float _p2;
-    float up[3];       float _p3;
-    uint32_t screenW, screenH, mapSize, mapHeight;
-    float tanHalfFov, maxDist, _p4[2];
-};
-static_assert(sizeof(FrameConstants) <= CB_ALIGN, "CB overflow");
+// Staging: 256-byte aligned row pitch for chunk width
+static constexpr UINT  STAGING_ROW = (CHUNK_X + 255u) & ~255u;  // 256
+static constexpr UINT  STAGING_SLICE = STAGING_ROW * CHUNK_Y;      // 32768
+static constexpr UINT  CHUNK_STAGING = STAGING_SLICE * CHUNK_Z;    // 1 048 576
 
-// ---------------------------------------------------------------------------
-//  File-static D3D12 state
-// ---------------------------------------------------------------------------
+static constexpr int   MAX_UPLOADS_PER_FRAME = 8;
+static constexpr UINT  FRAME_STAGING_SIZE = MAX_UPLOADS_PER_FRAME * CHUNK_STAGING;
+
+// ===================================================================
+//  Frame constants (HLSL mirror)
+// ===================================================================
+struct FrameConstants {
+    float    camPos[3];  float _p0;
+    float    fwd[3];     float _p1;
+    float    right[3];   float _p2;
+    float    up[3];      float _p3;
+    uint32_t screenW, screenH;
+    int32_t  loadMinCX, loadMinCZ;
+    int32_t  loadMaxCX, loadMaxCZ;
+    float    tanHalfFov, maxDist;
+};
+static_assert(sizeof(FrameConstants) <= CB_ALIGN);
+
+// ===================================================================
+//  Chunk data structures (file-local)
+// ===================================================================
+namespace {
+
+    struct ChunkSection {
+        uint8_t  blocks[CHUNK_X * SECTION_Y * CHUNK_Z]{};
+        uint16_t solidCount = 0;
+    };
+
+    struct Chunk {
+        std::unique_ptr<ChunkSection> sections[SECTIONS_PER_CHUNK];
+        uint8_t surfaceY[CHUNK_X * CHUNK_Z]{};
+
+        uint8_t getBlock(int lx, int ly, int lz) const {
+            if (ly < 0 || ly >= CHUNK_Y) return BLOCK_AIR;
+            int si = ly >> 4;
+            if (!sections[si]) return BLOCK_AIR;
+            return sections[si]->blocks[lx + (ly & 15) * CHUNK_X
+                + lz * SECTION_Y * CHUNK_X];
+        }
+
+        void setBlock(int lx, int ly, int lz, uint8_t bt) {
+            if (ly < 0 || ly >= CHUNK_Y) return;
+            int si = ly >> 4;
+            int idx = lx + (ly & 15) * CHUNK_X + lz * SECTION_Y * CHUNK_X;
+
+            if (!sections[si]) {
+                if (bt == BLOCK_AIR) return;
+                sections[si] = std::make_unique<ChunkSection>();
+            }
+            auto& s = *sections[si];
+            uint8_t old = s.blocks[idx];
+            if (old == bt) return;
+            if (old == BLOCK_AIR) ++s.solidCount;
+            if (bt == BLOCK_AIR) --s.solidCount;
+            s.blocks[idx] = bt;
+            if (s.solidCount == 0) sections[si].reset();
+        }
+    };
+
+    // ---- chunk key helpers ----
+    inline int64_t ChunkKey(int cx, int cz) {
+        return (int64_t(cx) << 32) | (int64_t(cz) & 0xFFFFFFFF);
+    }
+    inline int AtlasSlot(int c) {
+        return ((c % LOAD_CHUNKS) + LOAD_CHUNKS) % LOAD_CHUNKS;
+    }
+
+    // ---- chunk manager state ----
+    struct ChunkMgr {
+        std::unordered_map<int64_t, Chunk> chunks;
+        int centerCX = 0, centerCZ = 0;
+        int64_t slotKeys[LOAD_CHUNKS][LOAD_CHUNKS];
+        std::deque<std::pair<int, int>> uploadQueue;
+
+        void init() {
+            for (auto& row : slotKeys)
+                for (auto& k : row) k = INT64_MIN;
+        }
+    } cm;
+
+} // anon
+
+// ===================================================================
+//  GPU state (file-local)
+// ===================================================================
 static struct GpuState {
     ComPtr<ID3D12Device>              device;
     ComPtr<ID3D12CommandQueue>        queue;
@@ -56,26 +135,29 @@ static struct GpuState {
     ComPtr<ID3D12DescriptorHeap> srvHeap;
     UINT                         srvDescSize = 0;
 
-    ComPtr<ID3D12RootSignature> rootSig;
-    ComPtr<ID3D12PipelineState> pso;
+    ComPtr<ID3D12RootSignature>  rootSig;
+    ComPtr<ID3D12PipelineState>  pso;
 
-    ComPtr<ID3D12Resource> blockTex;            // Texture3D  R8_UINT
-    ComPtr<ID3D12Resource> outputTex;           // Texture2D  UAV
+    ComPtr<ID3D12Resource> atlas;                   // Texture3D 768×128×768
+    ComPtr<ID3D12Resource> outputTex;
     ComPtr<ID3D12Resource> backBuffers[FRAME_COUNT];
     ComPtr<ID3D12Resource> cbUpload;
     uint8_t* cbMapped = nullptr;
+
+    ComPtr<ID3D12Resource> frameStaging[FRAME_COUNT];
+    uint8_t* frameStagingMapped[FRAME_COUNT]{};
 } gpu;
 
-// ---------------------------------------------------------------------------
-//  Error handling
-// ---------------------------------------------------------------------------
-static void Check(HRESULT hr, const char* msg) {
-    if (FAILED(hr)) { OutputDebugStringA(msg); throw std::runtime_error(msg); }
+// ===================================================================
+//  Error helper
+// ===================================================================
+static void Check(HRESULT hr, const char* m) {
+    if (FAILED(hr)) { OutputDebugStringA(m); throw std::runtime_error(m); }
 }
 
-// ---------------------------------------------------------------------------
-//  Math / noise  (CPU-side terrain authoring)
-// ---------------------------------------------------------------------------
+// ===================================================================
+//  Noise (unchanged CPU-side terrain authoring)
+// ===================================================================
 static float Lerp(float a, float b, float t) { return a + (b - a) * t; }
 static float Smooth(float t) { return t * t * (3.0f - 2.0f * t); }
 
@@ -83,14 +165,14 @@ static uint32_t Hash2D(int x, int y) {
     uint32_t h = 2166136261u;
     h = (h ^ uint32_t(x)) * 16777619u;
     h = (h ^ uint32_t(y)) * 16777619u;
-    h ^= (h >> 13); h *= 1274126177u; h ^= (h >> 16);
+    h ^= h >> 13; h *= 1274126177u; h ^= h >> 16;
     return h;
 }
 static float Random01(int x, int y) {
     return float(Hash2D(x, y) & 0x00FFFFFF) / float(0x00FFFFFF);
 }
 
-float ValueNoise(float x, float y) {
+static float ValueNoise(float x, float y) {
     int x0 = int(std::floor(x)), y0 = int(std::floor(y));
     float sx = Smooth(x - float(x0)), sy = Smooth(y - float(y0));
     float a = Lerp(Random01(x0, y0), Random01(x0 + 1, y0), sx);
@@ -98,137 +180,206 @@ float ValueNoise(float x, float y) {
     return Lerp(a, b, sy);
 }
 
-float FBM(float x, float y, int octaves) {
-    float sum = 0, amp = 0.5f, freq = 1, norm = 0;
-    for (int i = 0; i < octaves; ++i) {
-        sum += ValueNoise(x * freq, y * freq) * amp;
-        norm += amp; amp *= 0.5f; freq *= 2.0f;
+static float FBM(float x, float y, int oct) {
+    float s = 0, a = 0.5f, f = 1, n = 0;
+    for (int i = 0; i < oct; ++i) {
+        s += ValueNoise(x * f, y * f) * a;
+        n += a; a *= 0.5f; f *= 2.0f;
     }
-    return sum / norm;
+    return s / n;
 }
 
-static int WrapCoord(int v) { return v & (MAP_SIZE - 1); }
+// ===================================================================
+//  Per-chunk terrain generation (same noise, applied per-column)
+// ===================================================================
+static void GenerateChunkTerrain(int cx, int cz) {
+    int64_t key = ChunkKey(cx, cz);
+    auto& chunk = cm.chunks[key];
 
-static uint8_t SampleHeightNearest(float wx, float wz) {
-    return gApp.heightMap[WrapCoord(int(std::floor(wz))) * MAP_SIZE
-        + WrapCoord(int(std::floor(wx)))];
-}
+    int wx0 = cx * CHUNK_X;
+    int wz0 = cz * CHUNK_Z;
 
-// ---------------------------------------------------------------------------
-//  Terrain generation  (fills 3-D blockMap + 2-D heightMap cache)
-// ---------------------------------------------------------------------------
-void GenerateTerrain() {
-    const size_t totalBlocks = size_t(MAP_SIZE) * MAP_HEIGHT * MAP_SIZE;
-    gApp.blockMap.assign(totalBlocks, BLOCK_AIR);
-    gApp.heightMap.resize(size_t(MAP_SIZE) * MAP_SIZE);
+    for (int lz = 0; lz < CHUNK_Z; ++lz) {
+        int wz = wz0 + lz;
+        for (int lx = 0; lx < CHUNK_X; ++lx) {
+            int wx = wx0 + lx;
 
-    for (int z = 0; z < MAP_SIZE; ++z) {
-        for (int x = 0; x < MAP_SIZE; ++x) {
-            float nx = x * 0.0035f, nz = z * 0.0035f;
-            float large = FBM(x * 0.0012f, z * 0.0012f, 5);
-            float medium = FBM(nx, nz, 6);
-            float detail = FBM(x * 0.012f, z * 0.012f, 4);
+            float large = FBM(wx * 0.0012f, wz * 0.0012f, 5);
+            float medium = FBM(wx * 0.0035f, wz * 0.0035f, 6);
+            float detail = FBM(wx * 0.012f, wz * 0.012f, 4);
 
             float e = 0.55f * medium + 0.30f * large + 0.15f * detail;
             e = std::pow(e, 1.35f);
+            float ridge = std::fabs(FBM(wx * 0.006f, wz * 0.006f, 5) - 0.5f) * 2.0f;
+            int surfH = std::clamp(int(20.0f + e * 170.0f + ridge * 18.0f), 0, CHUNK_Y - 1);
 
-            float ridge = std::fabs(FBM(x * 0.006f, z * 0.006f, 5) - 0.5f) * 2.0f;
-            float heightF = 20.0f + e * 170.0f + ridge * 18.0f;
-            int   surfH = std::clamp(int(heightF), 0, MAP_HEIGHT - 1);
+            chunk.surfaceY[lz * CHUNK_X + lx] = uint8_t(surfH);
 
-            gApp.heightMap[z * MAP_SIZE + x] = static_cast<uint8_t>(surfH);
-
-            // Determine surface block type from the same height-based palette
             BlockType surfType;
-            if (surfH < 42)  surfType = BLOCK_SAND;
-            else if (surfH < 52)  surfType = BLOCK_SAND;
-            else if (surfH < 58)  surfType = BLOCK_SAND;
+            if (surfH < 58)  surfType = BLOCK_SAND;
             else if (surfH < 140) surfType = BLOCK_GRASS;
             else if (surfH < 180) surfType = BLOCK_ROCK;
             else                  surfType = BLOCK_SNOW;
 
-            // Fill column
             for (int y = 0; y <= surfH; ++y) {
                 BlockType bt;
                 if (y < surfH - 4) bt = BLOCK_STONE;
                 else if (y < surfH)     bt = BLOCK_DIRT;
                 else                    bt = surfType;
-                gApp.blockMap[BlockIndex(WrapCoord(x), y, WrapCoord(z))] = bt;
+                chunk.setBlock(lx, y, lz, bt);
             }
-
-            // Water fill above solid ground up to water level
-            for (int y = surfH + 1; y <= WATER_LEVEL && y < MAP_HEIGHT; ++y) {
-                gApp.blockMap[BlockIndex(WrapCoord(x), y, WrapCoord(z))] =
-                    (y < 42) ? BLOCK_DEEP_WATER : BLOCK_WATER;
-            }
+            for (int y = surfH + 1; y <= WATER_LEVEL && y < CHUNK_Y; ++y)
+                chunk.setBlock(lx, y, lz, y < 42 ? BLOCK_DEEP_WATER : BLOCK_WATER);
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-//  HLSL compute shader — 3-D DDA voxel raycaster
-// ---------------------------------------------------------------------------
-static const char* g_shaderSrc = R"(
-cbuffer FrameConstants : register(b0)
-{
-    float3 camPos;    float _p0;
-    float3 camFwd;    float _p1;
-    float3 camRight;  float _p2;
-    float3 camUp;     float _p3;
-    uint   screenW, screenH, mapSize, mapHeight;
-    float  tanHalfFov, maxDist;
-    float2 _p4;
-};
-
-Texture3D<uint>     BlockMap : register(t0);
-RWTexture2D<float4> Output   : register(u0);
-
-static const int   MAX_STEPS = 512;
-static const float3 FOG_COLOR = float3(0.67, 0.80, 0.92);
-
-// ---- block colours (linear-ish RGB) ----
-static const float3 bcolors[9] = {
-    float3(0,0,0),                // 0 air
-    float3(0.50, 0.50, 0.50),    // 1 stone
-    float3(0.55, 0.36, 0.18),    // 2 dirt
-    float3(0.30, 0.58, 0.16),    // 3 grass (top)
-    float3(0.76, 0.70, 0.50),    // 4 sand
-    float3(0.15, 0.40, 0.68),    // 5 water
-    float3(0.91, 0.91, 0.96),    // 6 snow
-    float3(0.05, 0.14, 0.38),    // 7 deep water
-    float3(0.42, 0.42, 0.39),    // 8 rock
-};
-
-// face brightness:  +X  -X  +Y(top)  -Y(bottom)  +Z  -Z
-static const float faceBright[6] = { 0.80, 0.80, 1.00, 0.45, 0.65, 0.65 };
-
-uint WrapXZ(int v) { return uint(v) & (mapSize - 1u); }
-
-uint GetBlock(int3 p)
-{
-    if (p.y < 0 || p.y >= (int)mapHeight) return 0u;
-    return BlockMap.Load(int4(WrapXZ(p.x), p.y, WrapXZ(p.z), 0));
+// ===================================================================
+//  Surface height query (for camera ground-follow)
+// ===================================================================
+static uint8_t SurfaceHeightAt(float wx, float wz) {
+    int bx = int(std::floor(wx)), bz = int(std::floor(wz));
+    int cx = bx >> 5, cz = bz >> 5;
+    int lx = bx & 31, lz = bz & 31;
+    auto it = cm.chunks.find(ChunkKey(cx, cz));
+    if (it == cm.chunks.end()) return 0;
+    return it->second.surfaceY[lz * CHUNK_X + lx];
 }
 
-uint SimpleHash(int3 p)
+// ===================================================================
+//  Chunk streaming – determine which chunks to load/unload
+// ===================================================================
+static std::vector<std::pair<int, int>> UpdateLoadedArea(int newCX, int newCZ) {
+    std::vector<std::pair<int, int>> need;
+    int minCX = newCX - LOAD_CHUNKS / 2, maxCX = newCX + LOAD_CHUNKS / 2;
+    int minCZ = newCZ - LOAD_CHUNKS / 2, maxCZ = newCZ + LOAD_CHUNKS / 2;
+
+    for (int cx = minCX; cx < maxCX; ++cx) {
+        for (int cz = minCZ; cz < maxCZ; ++cz) {
+            int64_t key = ChunkKey(cx, cz);
+            if (cm.chunks.find(key) == cm.chunks.end())
+                GenerateChunkTerrain(cx, cz);
+
+            int sx = AtlasSlot(cx), sz = AtlasSlot(cz);
+            if (cm.slotKeys[sx][sz] != key) {
+                cm.slotKeys[sx][sz] = key;
+                need.push_back({ cx, cz });
+            }
+        }
+    }
+    cm.centerCX = newCX;
+    cm.centerCZ = newCZ;
+    return need;
+}
+
+static void EnqueueUploads(const std::vector<std::pair<int, int>>& list) {
+    for (auto& p : list)
+        cm.uploadQueue.push_back(p);
+}
+
+// ===================================================================
+//  GenerateTerrain – called from Demo.cpp before InitD3D12
+// ===================================================================
+void GenerateTerrain() {
+    cm.init();
+    int pcx = int(std::floor(gApp.camX)) >> 5;
+    int pcz = int(std::floor(gApp.camY)) >> 5;
+    auto need = UpdateLoadedArea(pcx, pcz);
+    EnqueueUploads(need);
+
+    // Set initial camera height
+    float sh = float(SurfaceHeightAt(gApp.camX, gApp.camY));
+    gApp.camZ = sh + 2.5f;
+}
+
+// ===================================================================
+//  Flatten sparse chunk into staging-buffer layout
+// ===================================================================
+static void FlattenChunk(const Chunk& c, uint8_t* dst) {
+    std::memset(dst, BLOCK_AIR, CHUNK_STAGING);
+    for (int si = 0; si < SECTIONS_PER_CHUNK; ++si) {
+        if (!c.sections[si]) continue;
+        const auto& sec = *c.sections[si];
+        for (int lz = 0; lz < CHUNK_Z; ++lz)
+            for (int lyl = 0; lyl < SECTION_Y; ++lyl) {
+                int wy = si * SECTION_Y + lyl;
+                std::memcpy(
+                    dst + size_t(lz) * STAGING_SLICE
+                    + size_t(wy) * STAGING_ROW,
+                    &sec.blocks[lyl * CHUNK_X + lz * SECTION_Y * CHUNK_X],
+                    CHUNK_X);
+            }
+    }
+}
+
+// ===================================================================
+//  HLSL compute shader – 3-D DDA through toroidal atlas
+// ===================================================================
+static const char* g_shaderSrc = R"(
+cbuffer CB : register(b0)
 {
-    uint h = uint(p.x) * 374761393u + uint(p.y) * 668265263u + uint(p.z) * 1274126177u;
+    float3 camPos;   float _p0;
+    float3 camFwd;   float _p1;
+    float3 camRight; float _p2;
+    float3 camUp;    float _p3;
+    uint   screenW, screenH;
+    int    loadMinCX, loadMinCZ;
+    int    loadMaxCX, loadMaxCZ;
+    float  tanHalfFov, maxDist;
+};
+
+Texture3D<uint>     Atlas  : register(t0);
+RWTexture2D<float4> Output : register(u0);
+
+static const int   MAX_STEPS = 512;
+static const int   LC = 24;
+static const int   CX = 32;
+static const int   CY = 128;
+static const float3 FOG_CLR = float3(0.67, 0.80, 0.92);
+
+static const float3 bcolors[9] = {
+    float3(0,0,0),
+    float3(0.50,0.50,0.50),
+    float3(0.55,0.36,0.18),
+    float3(0.30,0.58,0.16),
+    float3(0.76,0.70,0.50),
+    float3(0.15,0.40,0.68),
+    float3(0.91,0.91,0.96),
+    float3(0.05,0.14,0.38),
+    float3(0.42,0.42,0.39),
+};
+static const float faceBri[6] = { 0.80, 0.80, 1.00, 0.45, 0.65, 0.65 };
+
+uint PosMod(int v, int m) { return uint(((v % m) + m) % m); }
+
+uint GetBlock(int3 wp)
+{
+    if (wp.y < 0 || wp.y >= CY) return 0u;
+    int cx = wp.x >> 5;
+    int cz = wp.z >> 5;
+    if (cx < loadMinCX || cx >= loadMaxCX ||
+        cz < loadMinCZ || cz >= loadMaxCZ) return 0u;
+    uint sx = PosMod(cx, LC);
+    uint sz = PosMod(cz, LC);
+    uint lx = uint(wp.x) & 31u;
+    uint lz = uint(wp.z) & 31u;
+    return Atlas.Load(int4(sx * CX + lx, wp.y, sz * CX + lz, 0));
+}
+
+uint BHash(int3 p)
+{
+    uint h = uint(p.x)*374761393u + uint(p.y)*668265263u + uint(p.z)*1274126177u;
     h ^= h >> 13; h *= 1274126177u; h ^= h >> 16;
     return h;
 }
 
-float3 BlockColor(uint bt, int faceIdx, int3 bp)
+float3 BlockColor(uint bt, int face, int3 bp)
 {
     float3 c = bcolors[bt];
-    // grass: green on top, dirt on sides / bottom
-    if (bt == 3 && faceIdx != 2) c = bcolors[2];
-    // snow: slightly blue on sides
-    if (bt == 6 && faceIdx != 2) c *= float3(0.90, 0.92, 0.98);
-
-    // subtle per-block variation
-    float v = float(SimpleHash(bp) & 255u) / 255.0 * 0.08 - 0.04;
-    c *= (1.0 + v);
-    return c;
+    if (bt == 3 && face != 2) c = bcolors[2];
+    if (bt == 6 && face != 2) c *= float3(0.90,0.92,0.98);
+    float v = float(BHash(bp) & 255u) / 255.0 * 0.08 - 0.04;
+    return c * (1.0 + v);
 }
 
 [numthreads(8,8,1)]
@@ -236,423 +387,442 @@ void CSMain(uint3 tid : SV_DispatchThreadID)
 {
     if (tid.x >= screenW || tid.y >= screenH) return;
 
-    float aspect = float(screenW) / float(max(1u, screenH));
-    float px = (2.0 * (float(tid.x) + 0.5) / float(screenW) - 1.0) * aspect * tanHalfFov;
-    float py = (1.0 - 2.0 * (float(tid.y) + 0.5) / float(screenH)) * tanHalfFov;
+    float asp = float(screenW) / float(max(1u, screenH));
+    float px  = (2.0*(float(tid.x)+0.5)/float(screenW)-1.0) * asp * tanHalfFov;
+    float py  = (1.0-2.0*(float(tid.y)+0.5)/float(screenH)) * tanHalfFov;
+    float3 rd = normalize(camFwd + camRight*px + camUp*py);
 
-    float3 rd = normalize(camFwd + camRight * px + camUp * py);
+    int3   mp   = int3(floor(camPos));
+    int3   st   = int3(rd.x>=0?1:-1, rd.y>=0?1:-1, rd.z>=0?1:-1);
+    float3 tD   = abs(1.0/rd);
+    float3 tM;
+    tM.x = ((rd.x>=0)?(float(mp.x+1)-camPos.x):(camPos.x-float(mp.x)))*tD.x;
+    tM.y = ((rd.y>=0)?(float(mp.y+1)-camPos.y):(camPos.y-float(mp.y)))*tD.y;
+    tM.z = ((rd.z>=0)?(float(mp.z+1)-camPos.z):(camPos.z-float(mp.z)))*tD.z;
 
-    // ---- 3-D DDA setup ----
-    int3  mapPos = int3(floor(camPos));
-    int3  step   = int3(rd.x >= 0 ? 1 : -1,
-                        rd.y >= 0 ? 1 : -1,
-                        rd.z >= 0 ? 1 : -1);
-    float3 tDelta = abs(1.0 / rd);
-    float3 tMax;
-    tMax.x = ((rd.x >= 0) ? (float(mapPos.x + 1) - camPos.x)
-                           : (camPos.x - float(mapPos.x))) * tDelta.x;
-    tMax.y = ((rd.y >= 0) ? (float(mapPos.y + 1) - camPos.y)
-                           : (camPos.y - float(mapPos.y))) * tDelta.y;
-    tMax.z = ((rd.z >= 0) ? (float(mapPos.z + 1) - camPos.z)
-                           : (camPos.z - float(mapPos.z))) * tDelta.z;
+    float dist = 0; int face = -1; bool hit = false;
 
-    float dist     = 0;
-    int   faceIdx  = -1;   // 0:+X  1:-X  2:+Y  3:-Y  4:+Z  5:-Z
-    bool  hit      = false;
-
-    [loop]
-    for (int i = 0; i < MAX_STEPS; ++i)
+    [loop] for (int i = 0; i < MAX_STEPS; ++i)
     {
-        // advance to next voxel boundary
-        if (tMax.x < tMax.y)
-        {
-            if (tMax.x < tMax.z)
-            { dist = tMax.x; tMax.x += tDelta.x; mapPos.x += step.x;
-              faceIdx = step.x > 0 ? 1 : 0; }
-            else
-            { dist = tMax.z; tMax.z += tDelta.z; mapPos.z += step.z;
-              faceIdx = step.z > 0 ? 5 : 4; }
+        if (tM.x < tM.y) {
+            if (tM.x < tM.z) { dist=tM.x; tM.x+=tD.x; mp.x+=st.x; face=st.x>0?1:0; }
+            else              { dist=tM.z; tM.z+=tD.z; mp.z+=st.z; face=st.z>0?5:4; }
+        } else {
+            if (tM.y < tM.z) { dist=tM.y; tM.y+=tD.y; mp.y+=st.y; face=st.y>0?3:2; }
+            else              { dist=tM.z; tM.z+=tD.z; mp.z+=st.z; face=st.z>0?5:4; }
         }
-        else
-        {
-            if (tMax.y < tMax.z)
-            { dist = tMax.y; tMax.y += tDelta.y; mapPos.y += step.y;
-              faceIdx = step.y > 0 ? 3 : 2; }
-            else
-            { dist = tMax.z; tMax.z += tDelta.z; mapPos.z += step.z;
-              faceIdx = step.z > 0 ? 5 : 4; }
-        }
-
         if (dist > maxDist) break;
-        if (mapPos.y < 0) break;
-        if (mapPos.y >= (int)mapHeight) continue;
-
-        uint bt = GetBlock(mapPos);
+        if (mp.y < 0) break;
+        if (mp.y >= CY) continue;
+        uint bt = GetBlock(mp);
         if (bt != 0u) { hit = true; break; }
     }
 
     float4 color;
-    if (hit)
-    {
-        uint bt = GetBlock(mapPos);
-        float3 c = BlockColor(bt, faceIdx, mapPos);
-        c *= faceBright[faceIdx];
-
-        float fogT = saturate(dist / maxDist);
-        fogT *= fogT;
-        c = lerp(c, FOG_COLOR, fogT);
+    if (hit) {
+        uint bt = GetBlock(mp);
+        float3 c = BlockColor(bt, face, mp) * faceBri[face];
+        float fogT = saturate(dist/maxDist); fogT *= fogT;
+        c = lerp(c, FOG_CLR, fogT);
         color = float4(c, 1.0);
+    } else {
+        float t = rd.y*0.5+0.5;
+        color = float4(lerp(float3(0.67,0.80,0.92), float3(0.25,0.45,0.75), saturate(t)), 1);
     }
-    else
-    {
-        // sky gradient based on ray pitch
-        float t = rd.y * 0.5 + 0.5;
-        float3 lo = float3(0.67, 0.80, 0.92);
-        float3 hi = float3(0.25, 0.45, 0.75);
-        color = float4(lerp(lo, hi, saturate(t)), 1.0);
-    }
-
     Output[tid.xy] = color;
 }
 )";
 
-// ---------------------------------------------------------------------------
-//  D3D12 helpers
-// ---------------------------------------------------------------------------
+// ===================================================================
+//  D3D12 utilities
+// ===================================================================
 static D3D12_RESOURCE_BARRIER Transition(ID3D12Resource* r,
-    D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+    D3D12_RESOURCE_STATES bef, D3D12_RESOURCE_STATES aft) {
     D3D12_RESOURCE_BARRIER b{};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     b.Transition.pResource = r;
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    b.Transition.StateBefore = before;
-    b.Transition.StateAfter = after;
+    b.Transition.StateBefore = bef;
+    b.Transition.StateAfter = aft;
     return b;
 }
 
 static void WaitForGpu() {
-    Check(gpu.queue->Signal(gpu.fence.Get(), gpu.fenceValues[gpu.frameIndex]), "Signal");
+    Check(gpu.queue->Signal(gpu.fence.Get(), gpu.fenceValues[gpu.frameIndex]), "Sig");
     if (gpu.fence->GetCompletedValue() < gpu.fenceValues[gpu.frameIndex]) {
         Check(gpu.fence->SetEventOnCompletion(gpu.fenceValues[gpu.frameIndex],
-            gpu.fenceEvent), "SetEvent");
+            gpu.fenceEvent), "Evt");
         WaitForSingleObject(gpu.fenceEvent, INFINITE);
     }
     gpu.fenceValues[gpu.frameIndex]++;
 }
 
 static void MoveToNextFrame() {
-    const UINT64 submitted = gpu.fenceValues[gpu.frameIndex];
-    Check(gpu.queue->Signal(gpu.fence.Get(), submitted), "Signal");
+    UINT64 sub = gpu.fenceValues[gpu.frameIndex];
+    Check(gpu.queue->Signal(gpu.fence.Get(), sub), "Sig");
     gpu.frameIndex = gpu.swapChain->GetCurrentBackBufferIndex();
     if (gpu.fence->GetCompletedValue() < gpu.fenceValues[gpu.frameIndex]) {
         Check(gpu.fence->SetEventOnCompletion(gpu.fenceValues[gpu.frameIndex],
-            gpu.fenceEvent), "SetEvent");
+            gpu.fenceEvent), "Evt");
         WaitForSingleObject(gpu.fenceEvent, INFINITE);
     }
-    gpu.fenceValues[gpu.frameIndex] = submitted + 1;
+    gpu.fenceValues[gpu.frameIndex] = sub + 1;
 }
 
-static ComPtr<ID3D12Resource> CreateUploadBuffer(UINT64 size) {
+static ComPtr<ID3D12Resource> CreateUploadBuffer(UINT64 sz) {
     D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_UPLOAD;
     D3D12_RESOURCE_DESC rd{};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    rd.Width = size;
-    rd.Height = 1;
-    rd.DepthOrArraySize = 1;
-    rd.MipLevels = 1;
-    rd.Format = DXGI_FORMAT_UNKNOWN;
-    rd.SampleDesc.Count = 1;
+    rd.Width = sz; rd.Height = 1; rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1; rd.SampleDesc.Count = 1;
     rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    ComPtr<ID3D12Resource> res;
+    ComPtr<ID3D12Resource> r;
     Check(gpu.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&res)),
-        "CreateUploadBuffer");
-    return res;
+        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&r)),
+        "UploadBuf");
+    return r;
 }
 
 static ComPtr<ID3D12Resource> CreateDefaultTex2D(DXGI_FORMAT fmt, UINT w, UINT h,
-    D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state) {
+    D3D12_RESOURCE_FLAGS fl, D3D12_RESOURCE_STATES st) {
     D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rd{};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    rd.Width = w; rd.Height = h;
-    rd.DepthOrArraySize = 1; rd.MipLevels = 1;
-    rd.Format = fmt;
-    rd.SampleDesc.Count = 1;
-    rd.Flags = flags;
-    ComPtr<ID3D12Resource> res;
+    rd.Width = w; rd.Height = h; rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1; rd.Format = fmt; rd.SampleDesc.Count = 1; rd.Flags = fl;
+    ComPtr<ID3D12Resource> r;
     Check(gpu.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-        state, nullptr, IID_PPV_ARGS(&res)), "CreateTex2D");
-    return res;
+        st, nullptr, IID_PPV_ARGS(&r)), "Tex2D");
+    return r;
 }
 
 static ComPtr<ID3D12Resource> CreateDefaultTex3D(DXGI_FORMAT fmt,
     UINT w, UINT h, UINT d,
-    D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state) {
+    D3D12_RESOURCE_FLAGS fl, D3D12_RESOURCE_STATES st) {
     D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rd{};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
     rd.Width = w; rd.Height = h;
-    rd.DepthOrArraySize = static_cast<UINT16>(d);
-    rd.MipLevels = 1;
-    rd.Format = fmt;
-    rd.SampleDesc.Count = 1;
-    rd.Flags = flags;
-    ComPtr<ID3D12Resource> res;
+    rd.DepthOrArraySize = UINT16(d);
+    rd.MipLevels = 1; rd.Format = fmt; rd.SampleDesc.Count = 1; rd.Flags = fl;
+    ComPtr<ID3D12Resource> r;
     Check(gpu.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-        state, nullptr, IID_PPV_ARGS(&res)), "CreateTex3D");
-    return res;
+        st, nullptr, IID_PPV_ARGS(&r)), "Tex3D");
+    return r;
 }
 
-// Upload tightly-packed CPU data into a DEFAULT Texture3D via staging.
-static void UploadTexture3D(ID3D12GraphicsCommandList* cl,
-    ID3D12Resource* dst, DXGI_FORMAT fmt,
-    const void* src, UINT w, UINT h, UINT d, UINT texelBytes,
-    ComPtr<ID3D12Resource>& outStaging) {
+// Record a CopyTextureRegion for one chunk from staging into the atlas.
+static void RecordChunkCopy(ID3D12GraphicsCommandList* cl,
+    ID3D12Resource* staging, UINT64 stagingOffset,
+    ID3D12Resource* atlas, int cx, int cz) {
 
-    const UINT   rowPitch = (w * texelBytes + 255u) & ~255u;
-    const UINT64 slicePitch = UINT64(rowPitch) * h;
-    const UINT64 totalSize = slicePitch * d;
+    int ax = AtlasSlot(cx) * CHUNK_X;
+    int az = AtlasSlot(cz) * CHUNK_Z;
 
-    outStaging = CreateUploadBuffer(totalSize);
+    D3D12_TEXTURE_COPY_LOCATION src{};
+    src.pResource = staging;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint.Offset = stagingOffset;
+    src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8_UINT;
+    src.PlacedFootprint.Footprint.Width = CHUNK_X;
+    src.PlacedFootprint.Footprint.Height = CHUNK_Y;
+    src.PlacedFootprint.Footprint.Depth = CHUNK_Z;
+    src.PlacedFootprint.Footprint.RowPitch = STAGING_ROW;
 
-    uint8_t* mapped = nullptr;
-    Check(outStaging->Map(0, nullptr, reinterpret_cast<void**>(&mapped)), "Map3D");
-    const uint8_t* s = static_cast<const uint8_t*>(src);
-    const UINT srcRow = w * texelBytes;
-    for (UINT z = 0; z < d; ++z)
-        for (UINT y = 0; y < h; ++y)
-            memcpy(mapped + z * slicePitch + y * rowPitch,
-                s + (size_t(z) * h + y) * srcRow,
-                srcRow);
-    outStaging->Unmap(0, nullptr);
+    D3D12_TEXTURE_COPY_LOCATION dst{};
+    dst.pResource = atlas;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.SubresourceIndex = 0;
 
-    D3D12_TEXTURE_COPY_LOCATION dstLoc{};
-    dstLoc.pResource = dst;
-    dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    dstLoc.SubresourceIndex = 0;
-
-    D3D12_TEXTURE_COPY_LOCATION srcLoc{};
-    srcLoc.pResource = outStaging.Get();
-    srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    srcLoc.PlacedFootprint.Footprint.Format = fmt;
-    srcLoc.PlacedFootprint.Footprint.Width = w;
-    srcLoc.PlacedFootprint.Footprint.Height = h;
-    srcLoc.PlacedFootprint.Footprint.Depth = d;
-    srcLoc.PlacedFootprint.Footprint.RowPitch = rowPitch;
-
-    cl->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
+    cl->CopyTextureRegion(&dst, UINT(ax), 0, UINT(az), &src, nullptr);
 }
 
-// ---------------------------------------------------------------------------
+// ===================================================================
 //  Size-dependent resources
-// ---------------------------------------------------------------------------
+// ===================================================================
 static void CreateSizeDependentResources() {
     gpu.outputTex = CreateDefaultTex2D(DXGI_FORMAT_R8G8B8A8_UNORM,
         gApp.width, gApp.height,
         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
-    // UAV at heap slot 1
     D3D12_CPU_DESCRIPTOR_HANDLE h = gpu.srvHeap->GetCPUDescriptorHandleForHeapStart();
-    h.ptr += 1 * gpu.srvDescSize;
+    h.ptr += gpu.srvDescSize;
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
     uav.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
     gpu.device->CreateUnorderedAccessView(gpu.outputTex.Get(), nullptr, &uav, h);
 
     for (UINT i = 0; i < FRAME_COUNT; ++i)
-        Check(gpu.swapChain->GetBuffer(i, IID_PPV_ARGS(&gpu.backBuffers[i])), "GetBuffer");
+        Check(gpu.swapChain->GetBuffer(i, IID_PPV_ARGS(&gpu.backBuffers[i])), "BB");
 }
 
-void ResizeBackbuffer(int width, int height) {
-    if (!gpu.device) { gApp.width = width; gApp.height = height; return; }
+void ResizeBackbuffer(int w, int h) {
+    if (!gpu.device) { gApp.width = w; gApp.height = h; return; }
     WaitForGpu();
     for (UINT i = 0; i < FRAME_COUNT; ++i) {
         gpu.backBuffers[i].Reset();
         gpu.fenceValues[i] = gpu.fenceValues[gpu.frameIndex];
     }
     gpu.outputTex.Reset();
-    gApp.width = std::max(1, width);
-    gApp.height = std::max(1, height);
+    gApp.width = std::max(1, w);
+    gApp.height = std::max(1, h);
     Check(gpu.swapChain->ResizeBuffers(FRAME_COUNT, gApp.width, gApp.height,
         DXGI_FORMAT_R8G8B8A8_UNORM, 0), "Resize");
     gpu.frameIndex = gpu.swapChain->GetCurrentBackBufferIndex();
     CreateSizeDependentResources();
 }
 
-// ---------------------------------------------------------------------------
-//  One-time D3D12 initialisation
-// ---------------------------------------------------------------------------
+// ===================================================================
+//  Upload a batch of chunks (blocking).  Used during init.
+// ===================================================================
+static void UploadChunkBatch(const std::vector<std::pair<int, int>>& batch) {
+    if (batch.empty()) return;
+
+    uint8_t* mapped = gpu.frameStagingMapped[0];
+    for (size_t i = 0; i < batch.size(); ++i) {
+        auto [cx, cz] = batch[i];
+        auto it = cm.chunks.find(ChunkKey(cx, cz));
+        FlattenChunk(it->second, mapped + i * CHUNK_STAGING);
+    }
+
+    Check(gpu.cmdAlloc[0]->Reset(), "AR");
+    Check(gpu.cmdList->Reset(gpu.cmdAlloc[0].Get(), nullptr), "LR");
+
+    for (size_t i = 0; i < batch.size(); ++i) {
+        auto [cx, cz] = batch[i];
+        RecordChunkCopy(gpu.cmdList.Get(), gpu.frameStaging[0].Get(),
+            i * CHUNK_STAGING, gpu.atlas.Get(), cx, cz);
+    }
+
+    Check(gpu.cmdList->Close(), "Cl");
+    ID3D12CommandList* ls[] = { gpu.cmdList.Get() };
+    gpu.queue->ExecuteCommandLists(1, ls);
+    WaitForGpu();
+}
+
+// ===================================================================
+//  InitD3D12
+// ===================================================================
 void InitD3D12(HWND hwnd) {
     gApp.hwnd = hwnd;
 
 #if defined(_DEBUG)
     {
-        ComPtr<ID3D12Debug> dbg;
-        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg)))) dbg->EnableDebugLayer();
+        ComPtr<ID3D12Debug> d;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&d)))) d->EnableDebugLayer();
     }
 #endif
 
-    ComPtr<IDXGIFactory4> factory;
-    Check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "Factory");
+    ComPtr<IDXGIFactory4> fac;
+    Check(CreateDXGIFactory1(IID_PPV_ARGS(&fac)), "Fac");
     Check(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0,
-        IID_PPV_ARGS(&gpu.device)), "Device");
+        IID_PPV_ARGS(&gpu.device)), "Dev");
 
     D3D12_COMMAND_QUEUE_DESC qd{}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    Check(gpu.device->CreateCommandQueue(&qd, IID_PPV_ARGS(&gpu.queue)), "Queue");
+    Check(gpu.device->CreateCommandQueue(&qd, IID_PPV_ARGS(&gpu.queue)), "Q");
 
     DXGI_SWAP_CHAIN_DESC1 scd{};
-    scd.BufferCount = FRAME_COUNT;
-    scd.Width = gApp.width;
-    scd.Height = gApp.height;
+    scd.BufferCount = FRAME_COUNT; scd.Width = gApp.width; scd.Height = gApp.height;
     scd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     scd.SampleDesc.Count = 1;
     ComPtr<IDXGISwapChain1> sc1;
-    Check(factory->CreateSwapChainForHwnd(gpu.queue.Get(), hwnd, &scd,
-        nullptr, nullptr, &sc1), "SwapChain");
-    Check(sc1.As(&gpu.swapChain), "QI SC3");
+    Check(fac->CreateSwapChainForHwnd(gpu.queue.Get(), hwnd, &scd,
+        nullptr, nullptr, &sc1), "SC");
+    Check(sc1.As(&gpu.swapChain), "SC3");
     gpu.frameIndex = gpu.swapChain->GetCurrentBackBufferIndex();
 
-    // Descriptor heap: [0]=block SRV, [1]=output UAV
+    // Descriptor heap: [0]=atlas SRV, [1]=output UAV
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
     hd.NumDescriptors = 2;
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    Check(gpu.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&gpu.srvHeap)), "Heap");
+    Check(gpu.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&gpu.srvHeap)), "Hp");
     gpu.srvDescSize = gpu.device->GetDescriptorHandleIncrementSize(
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
     for (UINT i = 0; i < FRAME_COUNT; ++i)
         Check(gpu.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-            IID_PPV_ARGS(&gpu.cmdAlloc[i])), "Alloc");
+            IID_PPV_ARGS(&gpu.cmdAlloc[i])), "Al");
 
     Check(gpu.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
-        gpu.cmdAlloc[0].Get(), nullptr, IID_PPV_ARGS(&gpu.cmdList)), "CmdList");
+        gpu.cmdAlloc[0].Get(), nullptr, IID_PPV_ARGS(&gpu.cmdList)), "CL");
+    Check(gpu.cmdList->Close(), "CLClose");
 
     Check(gpu.device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
-        IID_PPV_ARGS(&gpu.fence)), "Fence");
+        IID_PPV_ARGS(&gpu.fence)), "Fn");
     gpu.fenceValues[gpu.frameIndex] = 1;
     gpu.fenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
 
-    // ---- Root signature: [0] root CBV b0, [1] table {t0, u0} ----
-    D3D12_DESCRIPTOR_RANGE ranges[2]{};
-    ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    ranges[0].NumDescriptors = 1;
-    ranges[0].BaseShaderRegister = 0;
-    ranges[0].OffsetInDescriptorsFromTableStart = 0;
-    ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-    ranges[1].NumDescriptors = 1;
-    ranges[1].BaseShaderRegister = 0;
-    ranges[1].OffsetInDescriptorsFromTableStart = 1;
+    // ---- Root signature: [0] CBV b0, [1] table {t0, u0} ----
+    D3D12_DESCRIPTOR_RANGE rng[2]{};
+    rng[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    rng[0].NumDescriptors = 1; rng[0].BaseShaderRegister = 0;
+    rng[0].OffsetInDescriptorsFromTableStart = 0;
+    rng[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    rng[1].NumDescriptors = 1; rng[1].BaseShaderRegister = 0;
+    rng[1].OffsetInDescriptorsFromTableStart = 1;
 
-    D3D12_ROOT_PARAMETER params[2]{};
-    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-    params[0].Descriptor.ShaderRegister = 0;
-    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[1].DescriptorTable.NumDescriptorRanges = 2;
-    params[1].DescriptorTable.pDescriptorRanges = ranges;
-    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_PARAMETER par[2]{};
+    par[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    par[0].Descriptor.ShaderRegister = 0;
+    par[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    par[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    par[1].DescriptorTable.NumDescriptorRanges = 2;
+    par[1].DescriptorTable.pDescriptorRanges = rng;
+    par[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     D3D12_ROOT_SIGNATURE_DESC rsd{};
-    rsd.NumParameters = 2;
-    rsd.pParameters = params;
+    rsd.NumParameters = 2; rsd.pParameters = par;
 
     ComPtr<ID3DBlob> sig, err;
     Check(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1,
-        &sig, &err), "SerializeRS");
+        &sig, &err), "SRS");
     Check(gpu.device->CreateRootSignature(0, sig->GetBufferPointer(),
         sig->GetBufferSize(), IID_PPV_ARGS(&gpu.rootSig)), "RS");
 
-    // ---- Compile compute shader ----
+    // ---- Compile CS ----
     ComPtr<ID3DBlob> cs;
     HRESULT hr = D3DCompile(g_shaderSrc, strlen(g_shaderSrc), nullptr, nullptr, nullptr,
         "CSMain", "cs_5_1", 0, 0, &cs, &err);
     if (FAILED(hr)) {
         if (err) OutputDebugStringA(static_cast<const char*>(err->GetBufferPointer()));
-        Check(hr, "CompileCS");
+        Check(hr, "CS");
     }
-
     D3D12_COMPUTE_PIPELINE_STATE_DESC psd{};
     psd.pRootSignature = gpu.rootSig.Get();
     psd.CS = { cs->GetBufferPointer(), cs->GetBufferSize() };
     Check(gpu.device->CreateComputePipelineState(&psd, IID_PPV_ARGS(&gpu.pso)), "PSO");
 
-    // ---- Constant buffer ring ----
+    // ---- CB ring ----
     gpu.cbUpload = CreateUploadBuffer(FRAME_COUNT * CB_ALIGN);
-    Check(gpu.cbUpload->Map(0, nullptr, reinterpret_cast<void**>(&gpu.cbMapped)), "MapCB");
+    Check(gpu.cbUpload->Map(0, nullptr, reinterpret_cast<void**>(&gpu.cbMapped)), "MCB");
 
-    // ---- Block texture (Texture3D R8_UINT) ----
-    gpu.blockTex = CreateDefaultTex3D(DXGI_FORMAT_R8_UINT,
-        MAP_SIZE, MAP_HEIGHT, MAP_SIZE,
+    // ---- Per-frame staging buffers ----
+    for (UINT i = 0; i < FRAME_COUNT; ++i) {
+        gpu.frameStaging[i] = CreateUploadBuffer(FRAME_STAGING_SIZE);
+        Check(gpu.frameStaging[i]->Map(0, nullptr,
+            reinterpret_cast<void**>(&gpu.frameStagingMapped[i])), "MS");
+    }
+
+    // ---- Atlas (COPY_DEST initially for bulk upload) ----
+    gpu.atlas = CreateDefaultTex3D(DXGI_FORMAT_R8_UINT,
+        ATLAS_XZ, CHUNK_Y, ATLAS_XZ,
         D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
 
-    ComPtr<ID3D12Resource> staging;
-    UploadTexture3D(gpu.cmdList.Get(), gpu.blockTex.Get(), DXGI_FORMAT_R8_UINT,
-        gApp.blockMap.data(), MAP_SIZE, MAP_HEIGHT, MAP_SIZE, 1, staging);
+    // ---- Bulk upload all queued chunks ----
+    {
+        std::vector<std::pair<int, int>> batch;
+        batch.reserve(MAX_UPLOADS_PER_FRAME);
+        while (!cm.uploadQueue.empty()) {
+            batch.clear();
+            for (int i = 0; i < MAX_UPLOADS_PER_FRAME && !cm.uploadQueue.empty(); ++i) {
+                batch.push_back(cm.uploadQueue.front());
+                cm.uploadQueue.pop_front();
+            }
+            UploadChunkBatch(batch);
+        }
+    }
 
-    auto bar = Transition(gpu.blockTex.Get(),
-        D3D12_RESOURCE_STATE_COPY_DEST,
-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    gpu.cmdList->ResourceBarrier(1, &bar);
+    // Transition atlas COPY_DEST -> NON_PIXEL_SHADER_RESOURCE
+    {
+        Check(gpu.cmdAlloc[0]->Reset(), "AR");
+        Check(gpu.cmdList->Reset(gpu.cmdAlloc[0].Get(), nullptr), "LR");
+        auto b = Transition(gpu.atlas.Get(),
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        gpu.cmdList->ResourceBarrier(1, &b);
+        Check(gpu.cmdList->Close(), "Cl");
+        ID3D12CommandList* ls[] = { gpu.cmdList.Get() };
+        gpu.queue->ExecuteCommandLists(1, ls);
+        WaitForGpu();
+    }
 
-    Check(gpu.cmdList->Close(), "Close upload");
-    ID3D12CommandList* lists[] = { gpu.cmdList.Get() };
-    gpu.queue->ExecuteCommandLists(1, lists);
-    WaitForGpu();
-    // staging released here; blockMap kept for future CPU-side block edits
-
-    // ---- SRV for block texture (heap slot 0) ----
-    D3D12_CPU_DESCRIPTOR_HANDLE srvH = gpu.srvHeap->GetCPUDescriptorHandleForHeapStart();
-    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-    srv.Format = DXGI_FORMAT_R8_UINT;
-    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
-    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    srv.Texture3D.MipLevels = 1;
-    gpu.device->CreateShaderResourceView(gpu.blockTex.Get(), &srv, srvH);
+    // ---- Atlas SRV (slot 0) ----
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE h = gpu.srvHeap->GetCPUDescriptorHandleForHeapStart();
+        D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+        sv.Format = DXGI_FORMAT_R8_UINT;
+        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sv.Texture3D.MipLevels = 1;
+        gpu.device->CreateShaderResourceView(gpu.atlas.Get(), &sv, h);
+    }
 
     CreateSizeDependentResources();
 }
 
-// ---------------------------------------------------------------------------
-//  Per-frame render
-// ---------------------------------------------------------------------------
+// ===================================================================
+//  Render  (streaming uploads + dispatch + present)
+// ===================================================================
 void Render() {
-    auto* alloc = gpu.cmdAlloc[gpu.frameIndex].Get();
-    Check(alloc->Reset(), "AllocReset");
-    Check(gpu.cmdList->Reset(alloc, gpu.pso.Get()), "ListReset");
+    // ---- Chunk streaming: check if player crossed chunk boundary ----
+    int pcx = int(std::floor(gApp.camX)) >> 5;
+    int pcz = int(std::floor(gApp.camY)) >> 5;
+    if (pcx != cm.centerCX || pcz != cm.centerCZ) {
+        auto need = UpdateLoadedArea(pcx, pcz);
+        EnqueueUploads(need);
+    }
 
-    // Build camera basis on CPU
+    auto* alloc = gpu.cmdAlloc[gpu.frameIndex].Get();
+    Check(alloc->Reset(), "AR");
+    Check(gpu.cmdList->Reset(alloc, gpu.pso.Get()), "LR");
+
+    // ---- Per-frame chunk uploads ----
+    int uploadsThisFrame = std::min(int(cm.uploadQueue.size()), MAX_UPLOADS_PER_FRAME);
+    if (uploadsThisFrame > 0) {
+        uint8_t* mapped = gpu.frameStagingMapped[gpu.frameIndex];
+        std::vector<std::pair<int, int>> batch(uploadsThisFrame);
+        for (int i = 0; i < uploadsThisFrame; ++i) {
+            batch[i] = cm.uploadQueue.front();
+            cm.uploadQueue.pop_front();
+            auto it = cm.chunks.find(ChunkKey(batch[i].first, batch[i].second));
+            if (it != cm.chunks.end())
+                FlattenChunk(it->second, mapped + size_t(i) * CHUNK_STAGING);
+        }
+
+        auto bPre = Transition(gpu.atlas.Get(),
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_COPY_DEST);
+        gpu.cmdList->ResourceBarrier(1, &bPre);
+
+        for (int i = 0; i < uploadsThisFrame; ++i)
+            RecordChunkCopy(gpu.cmdList.Get(),
+                gpu.frameStaging[gpu.frameIndex].Get(),
+                UINT64(i) * CHUNK_STAGING,
+                gpu.atlas.Get(), batch[i].first, batch[i].second);
+
+        auto bPost = Transition(gpu.atlas.Get(),
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        gpu.cmdList->ResourceBarrier(1, &bPost);
+    }
+
+    // ---- Build frame constants ----
     float cosP = std::cos(gApp.pitch), sinP = std::sin(gApp.pitch);
     float cosA = std::cos(gApp.angle), sinA = std::sin(gApp.angle);
 
+    int halfLC = LOAD_CHUNKS / 2;
     FrameConstants fc{};
-    // World coords: X = gApp.camX,  Y(up) = gApp.camZ,  Z = gApp.camY
     fc.camPos[0] = gApp.camX;
     fc.camPos[1] = gApp.camZ;
     fc.camPos[2] = gApp.camY;
-    fc.fwd[0] = cosP * cosA;
-    fc.fwd[1] = sinP;
-    fc.fwd[2] = cosP * sinA;
-    fc.right[0] = -sinA;
-    fc.right[1] = 0.0f;
-    fc.right[2] = cosA;
-    // up = cross(right, forward)
-    fc.up[0] = -sinP * cosA;
-    fc.up[1] = cosP;
-    fc.up[2] = -sinP * sinA;
+    fc.fwd[0] = cosP * cosA;  fc.fwd[1] = sinP;  fc.fwd[2] = cosP * sinA;
+    fc.right[0] = -sinA;        fc.right[1] = 0.0f;  fc.right[2] = cosA;
+    fc.up[0] = -sinP * cosA; fc.up[1] = cosP;  fc.up[2] = -sinP * sinA;
     fc.screenW = UINT(gApp.width);
     fc.screenH = UINT(gApp.height);
-    fc.mapSize = UINT(MAP_SIZE);
-    fc.mapHeight = UINT(MAP_HEIGHT);
+    fc.loadMinCX = cm.centerCX - halfLC;
+    fc.loadMinCZ = cm.centerCZ - halfLC;
+    fc.loadMaxCX = cm.centerCX + halfLC;
+    fc.loadMaxCZ = cm.centerCZ + halfLC;
     fc.tanHalfFov = 0.8f;
     fc.maxDist = 300.0f;
+    std::memcpy(gpu.cbMapped + gpu.frameIndex * CB_ALIGN, &fc, sizeof(fc));
 
-    memcpy(gpu.cbMapped + gpu.frameIndex * CB_ALIGN, &fc, sizeof(fc));
-
+    // ---- Dispatch ----
     gpu.cmdList->SetComputeRootSignature(gpu.rootSig.Get());
     ID3D12DescriptorHeap* heaps[] = { gpu.srvHeap.Get() };
     gpu.cmdList->SetDescriptorHeaps(1, heaps);
@@ -663,6 +833,7 @@ void Render() {
 
     gpu.cmdList->Dispatch((gApp.width + 7) / 8, (gApp.height + 7) / 8, 1);
 
+    // ---- Copy output -> back buffer ----
     D3D12_RESOURCE_BARRIER pre[2] = {
         Transition(gpu.outputTex.Get(),
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
@@ -680,34 +851,34 @@ void Render() {
     };
     gpu.cmdList->ResourceBarrier(2, post);
 
-    Check(gpu.cmdList->Close(), "Close");
-    ID3D12CommandList* lists[] = { gpu.cmdList.Get() };
-    gpu.queue->ExecuteCommandLists(1, lists);
-    Check(gpu.swapChain->Present(1, 0), "Present");
+    Check(gpu.cmdList->Close(), "Cl");
+    ID3D12CommandList* ls[] = { gpu.cmdList.Get() };
+    gpu.queue->ExecuteCommandLists(1, ls);
+    Check(gpu.swapChain->Present(1, 0), "Pr");
     MoveToNextFrame();
 }
 
-// ---------------------------------------------------------------------------
+// ===================================================================
 //  Shutdown
-// ---------------------------------------------------------------------------
+// ===================================================================
 void ShutdownD3D12() {
     if (!gpu.device) return;
     WaitForGpu();
+    for (UINT i = 0; i < FRAME_COUNT; ++i) {
+        if (gpu.frameStagingMapped[i]) {
+            gpu.frameStaging[i]->Unmap(0, nullptr);
+            gpu.frameStagingMapped[i] = nullptr;
+        }
+    }
     if (gpu.cbMapped) { gpu.cbUpload->Unmap(0, nullptr); gpu.cbMapped = nullptr; }
     if (gpu.fenceEvent) { CloseHandle(gpu.fenceEvent); gpu.fenceEvent = nullptr; }
+    cm.chunks.clear();
 }
 
-// ---------------------------------------------------------------------------
-//  Input / camera
-// ---------------------------------------------------------------------------
+// ===================================================================
+//  Camera / input
+// ===================================================================
 static bool KeyDown(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
-
-static void WrapCamera() {
-    while (gApp.camX < 0.0f)             gApp.camX += float(MAP_SIZE);
-    while (gApp.camY < 0.0f)             gApp.camY += float(MAP_SIZE);
-    while (gApp.camX >= float(MAP_SIZE))  gApp.camX -= float(MAP_SIZE);
-    while (gApp.camY >= float(MAP_SIZE))  gApp.camY -= float(MAP_SIZE);
-}
 
 static void CenterCursor() {
     RECT r; GetClientRect(gApp.hwnd, &r);
@@ -720,28 +891,20 @@ void UpdateCamera(float dt) {
     float moveSpeed = 8.0f, strafeSpeed = 7.0f, liftSpeed = 8.0f;
     if (KeyDown(VK_SHIFT)) { moveSpeed *= 3; strafeSpeed *= 3; liftSpeed *= 3; }
 
-    // ---- mouse look ----
     if (gApp.mouseCaptured) {
         RECT cr; GetClientRect(gApp.hwnd, &cr);
-        POINT center = { (cr.right - cr.left) / 2, (cr.bottom - cr.top) / 2 };
-        POINT screenCenter = center;
-        ClientToScreen(gApp.hwnd, &screenCenter);
-
+        POINT sc = { (cr.right - cr.left) / 2, (cr.bottom - cr.top) / 2 };
+        ClientToScreen(gApp.hwnd, &sc);
         POINT cur; GetCursorPos(&cur);
-        float dx = float(cur.x - screenCenter.x);
-        float dy = float(cur.y - screenCenter.y);
-        const float sens = 0.002f;
-        gApp.angle += dx * sens;
-        gApp.pitch -= dy * sens;
-        gApp.pitch = std::clamp(gApp.pitch, -1.48f, 1.48f);  // ~±85°
-        SetCursorPos(screenCenter.x, screenCenter.y);
+        float dx = float(cur.x - sc.x), dy = float(cur.y - sc.y);
+        gApp.angle += dx * 0.002f;
+        gApp.pitch -= dy * 0.002f;
+        gApp.pitch = std::clamp(gApp.pitch, -1.48f, 1.48f);
+        SetCursorPos(sc.x, sc.y);
     }
-
-    // ---- keyboard look (fallback) ----
     if (KeyDown(VK_LEFT))  gApp.angle -= 1.7f * dt;
     if (KeyDown(VK_RIGHT)) gApp.angle += 1.7f * dt;
 
-    // ---- movement (horizontal, independent of pitch) ----
     float fwd = 0, str = 0;
     if (KeyDown('W') || KeyDown(VK_UP))   fwd += 1;
     if (KeyDown('S') || KeyDown(VK_DOWN)) fwd -= 1;
@@ -754,7 +917,6 @@ void UpdateCamera(float dt) {
     gApp.camX += -sinA * str * strafeSpeed * dt;
     gApp.camY += cosA * str * strafeSpeed * dt;
 
-    // ---- vertical / fly ----
     if (KeyDown('T')) gApp.flyMode = true;
     if (KeyDown('G')) gApp.flyMode = false;
 
@@ -763,29 +925,29 @@ void UpdateCamera(float dt) {
         if (KeyDown(VK_CONTROL) || KeyDown('F')) gApp.camZ -= liftSpeed * dt;
     }
     else {
-        float surfH = float(SampleHeightNearest(gApp.camX, gApp.camY));
-        float eyeTarget = surfH + 1.0f + 1.5f;   // top-of-block + eye offset
+        float sh = float(SurfaceHeightAt(gApp.camX, gApp.camY));
+        float target = sh + 1.0f + 1.5f;
         float follow = std::clamp(dt * 8.0f, 0.0f, 1.0f);
-        gApp.camZ = Lerp(gApp.camZ, eyeTarget, follow);
+        gApp.camZ = Lerp(gApp.camZ, target, follow);
     }
-    WrapCamera();
 }
 
 void UpdateWindowTitle(HWND hwnd, float dt) {
     gApp.fpsTimer += dt; gApp.fpsFrames++;
     if (gApp.fpsTimer >= 0.5f) {
         float fps = float(gApp.fpsFrames) / gApp.fpsTimer;
-        std::wstring t = L"Voxel Block Terrain | "
-            L"W/S/A/D move, mouse look, T fly, G walk, Space/Ctrl up/down | FPS: "
-            + std::to_wstring(int(fps));
-        SetWindowTextW(hwnd, t.c_str());
+        int loaded = int(cm.chunks.size());
+        int queued = int(cm.uploadQueue.size());
+        wchar_t buf[256];
+        swprintf_s(buf, L"Voxel Terrain | chunks:%d queue:%d | FPS:%d", loaded, queued, int(fps));
+        SetWindowTextW(hwnd, buf);
         gApp.fpsTimer = 0; gApp.fpsFrames = 0;
     }
 }
 
-// ---------------------------------------------------------------------------
+// ===================================================================
 //  Window procedure
-// ---------------------------------------------------------------------------
+// ===================================================================
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_SIZE: {

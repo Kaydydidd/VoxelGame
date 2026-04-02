@@ -5,22 +5,26 @@
 #endif
 #include <windows.h>
 
-#include <algorithm>
-#include <chrono>
-#include <cmath>
 #include <cstdint>
 #include <string>
-#include <vector>
+
 
 // ---------------------------------------------------------------------------
-//  World constants
+//  World / chunk constants
 // ---------------------------------------------------------------------------
-inline constexpr int   MAP_SIZE = 1024;   // horizontal extent (power-of-two)
-inline constexpr int   MAP_HEIGHT = 256;    // vertical extent
+inline constexpr int   CHUNK_X = 32;
+inline constexpr int   CHUNK_Z = 32;
+inline constexpr int   CHUNK_Y = 128;
+inline constexpr int   SECTION_Y = 16;
+inline constexpr int   SECTIONS_PER_CHUNK = CHUNK_Y / SECTION_Y;   // 8
+inline constexpr int   REGION_CHUNKS = 8;                       // chunks per region side
+inline constexpr int   LOAD_REGIONS = 3;                       // 3×3 regions loaded
+inline constexpr int   LOAD_CHUNKS = LOAD_REGIONS * REGION_CHUNKS; // 24 per axis
+inline constexpr int   ATLAS_XZ = LOAD_CHUNKS * CHUNK_X;   // 768
 inline constexpr float PI = 3.1415926535f;
 
 // ---------------------------------------------------------------------------
-//  Block types – each voxel stores one of these
+//  Block types
 // ---------------------------------------------------------------------------
 enum BlockType : uint8_t {
     BLOCK_AIR = 0,
@@ -36,34 +40,19 @@ enum BlockType : uint8_t {
 };
 
 // ---------------------------------------------------------------------------
-//  3-D block index   (X fastest, then Y, then Z)
-//  Block at world integer coordinate (x, y, z) occupies unit cube [x,x+1)…
-// ---------------------------------------------------------------------------
-inline int BlockIndex(int x, int y, int z) {
-    return x + y * MAP_SIZE + z * MAP_SIZE * MAP_HEIGHT;
-}
-
-// ---------------------------------------------------------------------------
-//  Application state  – shared between Demo.cpp and voxel.cpp
-//  D3D12 resources live in file-static storage inside voxel.cpp.
+//  Application state – only fields Demo.cpp touches.
+//  Chunk data and GPU resources live in voxel.cpp file scope.
 // ---------------------------------------------------------------------------
 struct AppState {
     int  width = 1280;
     int  height = 720;
     HWND hwnd = nullptr;
 
-    // 3-D block grid  (MAP_SIZE × MAP_HEIGHT × MAP_SIZE)
-    std::vector<uint8_t> blockMap;
-
-    // 2-D surface-height cache for CPU camera follow (MAP_SIZE × MAP_SIZE)
-    std::vector<uint8_t> heightMap;
-
-    // Camera
-    float camX = 512.0f;          // world X
-    float camY = 512.0f;          // world Z  (second horizontal axis)
-    float camZ = 90.0f;           // world Y  (altitude)
-    float angle = 0.0f;            // yaw   (radians)
-    float pitch = 0.0f;            // pitch (radians)
+    float camX = 512.0f;
+    float camY = 512.0f;
+    float camZ = 90.0f;
+    float angle = 0.0f;
+    float pitch = 0.0f;
 
     bool running = true;
     bool flyMode = false;
@@ -76,7 +65,7 @@ struct AppState {
 extern AppState gApp;
 
 // ---------------------------------------------------------------------------
-//  Public interface consumed by Demo.cpp
+//  Public interface (signatures match Demo.cpp call sites)
 // ---------------------------------------------------------------------------
 void GenerateTerrain();
 void InitD3D12(HWND hwnd);
