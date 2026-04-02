@@ -114,8 +114,9 @@ namespace {
         int centerRX = INT_MIN, centerRZ = INT_MIN;
         int64_t slotKeys[LOAD_CHUNKS][LOAD_CHUNKS];
 
-        std::deque<std::pair<int, int>> genQueue;       // CPU terrain generation
-        std::deque<std::pair<int, int>> uploadQueue;     // GPU atlas upload
+        std::deque<std::pair<int, int>> genQueue;
+        std::deque<std::pair<int, int>> uploadQueue;
+        std::deque<std::pair<int, int>> clearQueue;     // atlas slots to zero out
 
         void init() {
             centerRX = centerRZ = INT_MIN;
@@ -150,6 +151,7 @@ static struct GpuState {
     ComPtr<ID3D12Resource> outputTex;
     ComPtr<ID3D12Resource> backBuffers[FRAME_COUNT];
     ComPtr<ID3D12Resource> cbUpload;
+    ComPtr<ID3D12Resource> zeroStaging;            // 1 chunk, permanently zeroed
     uint8_t* cbMapped = nullptr;
 
     ComPtr<ID3D12Resource> frameStaging[FRAME_COUNT];
@@ -321,8 +323,10 @@ static void EvictRegion(int rx, int rz) {
         for (int cz = czMin; cz < czMin + REGION_CHUNKS; ++cz) {
             int64_t key = ChunkKey(cx, cz);
             int sx = AtlasSlot(cx), sz = AtlasSlot(cz);
-            if (cm.slotKeys[sx][sz] == key)
+            if (cm.slotKeys[sx][sz] == key) {
                 cm.slotKeys[sx][sz] = INT64_MIN;
+                cm.clearQueue.push_back({ cx, cz });
+            }
             cm.chunks.erase(key);
         }
 }
@@ -330,10 +334,8 @@ static void EvictRegion(int rx, int rz) {
 static void ScheduleRegionTransition(int newRX, int newRZ) {
     int oldRX = cm.centerRX, oldRZ = cm.centerRZ;
 
-    // Discard stale generation work from any prior incomplete transition
     cm.genQueue.clear();
 
-    // ---- Evict regions that left the 3×3 (fast: hashmap erase only) ----
     if (oldRX != INT_MIN) {
         for (int rx = oldRX - 1; rx <= oldRX + 1; ++rx)
             for (int rz = oldRZ - 1; rz <= oldRZ + 1; ++rz)
@@ -341,11 +343,9 @@ static void ScheduleRegionTransition(int newRX, int newRZ) {
                     EvictRegion(rx, rz);
     }
 
-    // ---- Update center immediately so shader bounds are correct ----
     cm.centerRX = newRX;
     cm.centerRZ = newRZ;
 
-    // ---- Queue work for the full new 3×3 ----
     for (int rx = newRX - 1; rx <= newRX + 1; ++rx)
         for (int rz = newRZ - 1; rz <= newRZ + 1; ++rz) {
             int cxMin = rx * REGION_CHUNKS;
@@ -354,7 +354,6 @@ static void ScheduleRegionTransition(int newRX, int newRZ) {
                 for (int cz = czMin; cz < czMin + REGION_CHUNKS; ++cz) {
                     int64_t key = ChunkKey(cx, cz);
                     if (cm.chunks.count(key)) {
-                        // Retained from overlap — just ensure atlas slot is current
                         int sx = AtlasSlot(cx), sz = AtlasSlot(cz);
                         if (cm.slotKeys[sx][sz] != key) {
                             cm.slotKeys[sx][sz] = key;
@@ -362,11 +361,20 @@ static void ScheduleRegionTransition(int newRX, int newRZ) {
                         }
                     }
                     else {
-                        // Needs CPU generation (deferred)
                         cm.genQueue.push_back({ cx, cz });
                     }
                 }
         }
+
+    // ---- Sort generation queue: nearest chunks first ----
+    int pcx = int(std::floor(gApp.camX)) >> 5;
+    int pcz = int(std::floor(gApp.camY)) >> 5;
+    std::sort(cm.genQueue.begin(), cm.genQueue.end(),
+        [pcx, pcz](const std::pair<int, int>& a, const std::pair<int, int>& b) {
+            int dxa = a.first - pcx, dza = a.second - pcz;
+            int dxb = b.first - pcx, dzb = b.second - pcz;
+            return (dxa * dxa + dza * dza) < (dxb * dxb + dzb * dzb);
+        });
 }
 
 static void ProcessGenQueue() {
@@ -881,6 +889,15 @@ void InitD3D12(HWND hwnd) {
         gpu.device->CreateShaderResourceView(gpu.atlas.Get(), &sv, h);
     }
 
+    // ---- Zero staging for atlas clears (one chunk, zeroed once) ----
+    gpu.zeroStaging = CreateUploadBuffer(CHUNK_STAGING);
+    {
+        uint8_t* zp = nullptr;
+        Check(gpu.zeroStaging->Map(0, nullptr, reinterpret_cast<void**>(&zp)), "MZ");
+        std::memset(zp, 0, CHUNK_STAGING);
+        gpu.zeroStaging->Unmap(0, nullptr);
+    }
+
     CreateSizeDependentResources();
 }
 
@@ -915,6 +932,34 @@ void Render() {
             batch.push_back({ cx, cz });
             ++uploaded;
         }
+    }
+
+    bool hasAtlasWork = !cm.clearQueue.empty() || !batch.empty();
+    if (hasAtlasWork) {
+        auto bPre = Transition(gpu.atlas.Get(),
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_COPY_DEST);
+        gpu.cmdList->ResourceBarrier(1, &bPre);
+
+        // Clears first: zero out evicted slots (all in one frame, no budget limit)
+        while (!cm.clearQueue.empty()) {
+            auto [cx, cz] = cm.clearQueue.front();
+            cm.clearQueue.pop_front();
+            RecordChunkCopy(gpu.cmdList.Get(), gpu.zeroStaging.Get(), 0,
+                gpu.atlas.Get(), cx, cz);
+        }
+
+        // Then uploads: new chunk data overwrites cleared or stale slots
+        for (size_t i = 0; i < batch.size(); ++i)
+            RecordChunkCopy(gpu.cmdList.Get(),
+                gpu.frameStaging[gpu.frameIndex].Get(),
+                UINT64(i) * CHUNK_STAGING,
+                gpu.atlas.Get(), batch[i].first, batch[i].second);
+
+        auto bPost = Transition(gpu.atlas.Get(),
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        gpu.cmdList->ResourceBarrier(1, &bPost);
     }
 
     if (!batch.empty()) {
