@@ -7,5 +7,5 @@
     <File Path="DemoMain.cpp" />
     <File Path="voxel.cpp" />
   </Folder>
-  <Project Path="VoxelGame.vcxproj" />
+  <Project Path="VoxelGame.vcxproj" Id="408999e1-479a-4ed0-997a-208615ab6499" />
 </Solution>

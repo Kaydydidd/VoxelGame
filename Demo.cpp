@@ -2,11 +2,12 @@
 #include <windows.h>
 #include "voxel.h"
 
+int RunVoxelTerrainDemo(HINSTANCE hInstance, int nCmdShow);
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     return RunVoxelTerrainDemo(hInstance, nCmdShow);
 }
 
-// Implemented in VoxelTerrainRenderer.cpp
 int RunVoxelTerrainDemo(HINSTANCE hInstance, int nCmdShow) {
     const wchar_t CLASS_NAME[] = L"ScratchVoxelRendererWindowClass";
 
@@ -30,16 +31,17 @@ int RunVoxelTerrainDemo(HINSTANCE hInstance, int nCmdShow) {
         CW_USEDEFAULT, CW_USEDEFAULT,
         rect.right - rect.left,
         rect.bottom - rect.top,
-        nullptr,
-        nullptr,
-        hInstance,
-        nullptr
+        nullptr, nullptr, hInstance, nullptr
     );
 
     if (!hwnd) return 0;
 
-    ResizeBackbuffer(gApp.width, gApp.height);
+    // WM_SIZE has already fired during CreateWindowExW and stashed the
+    // client dimensions via ResizeBackbuffer's no-device early-out.
+
+    // Order matters: terrain must exist before InitD3D12 uploads it.
     GenerateTerrain();
+    InitD3D12(hwnd);          // device, queue, swap chain, PSO, terrain upload
 
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
@@ -47,25 +49,25 @@ int RunVoxelTerrainDemo(HINSTANCE hInstance, int nCmdShow) {
     auto lastTime = std::chrono::high_resolution_clock::now();
 
     MSG msg{};
+    gApp.running = true;
     while (gApp.running) {
         while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            if (msg.message == WM_QUIT) {
-                gApp.running = false;
-            }
+            if (msg.message == WM_QUIT) gApp.running = false;
             TranslateMessage(&msg);
             DispatchMessage(&msg);
         }
+        if (!gApp.running) break;
 
         auto now = std::chrono::high_resolution_clock::now();
         float dt = std::chrono::duration<float>(now - lastTime).count();
         lastTime = now;
-        dt = std::min(dt, 0.033f); // avoid huge jumps
+        dt = std::min(dt, 0.033f);
 
-        UpdateCamera(dt);
-        RenderVoxelTerrain();
-        Present(hwnd);
+        UpdateCamera(dt);          // CPU simulation
+        Render();                  // record + submit + present (GPU does all shading)
         UpdateWindowTitle(hwnd, dt);
     }
 
+    ShutdownD3D12();               // drain queue, release handles
     return 0;
 }

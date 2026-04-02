@@ -56,6 +56,10 @@ bool KeyDown(int vk);
 void WrapCamera();
 void UpdateCamera(float dt);
 void UpdateWindowTitle(HWND hwnd, float dt);
+void Render();
+static void WaitForGpu();
+static void MoveToNextFrame();
+void ShutdownD3D12();
+void InitD3D12(HWND hwnd);
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
-int RunVoxelTerrainDemo(HINSTANCE hInstance, int nCmdShow);
