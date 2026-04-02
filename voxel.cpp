@@ -39,6 +39,11 @@ static constexpr UINT  CHUNK_STAGING = STAGING_SLICE * CHUNK_Z;    // 1 048 576
 static constexpr int   MAX_UPLOADS_PER_FRAME = 8;
 static constexpr UINT  FRAME_STAGING_SIZE = MAX_UPLOADS_PER_FRAME * CHUNK_STAGING;
 
+static constexpr int MAX_GENS_PER_FRAME = 16;
+static constexpr int REGION_CHUNK_SHIFT = 3;     // log2(REGION_CHUNKS)
+
+static int ChunkToRegion(int c) { return c >> REGION_CHUNK_SHIFT; }
+
 // ===================================================================
 //  Frame constants (HLSL mirror)
 // ===================================================================
@@ -106,11 +111,14 @@ namespace {
     // ---- chunk manager state ----
     struct ChunkMgr {
         std::unordered_map<int64_t, Chunk> chunks;
-        int centerCX = 0, centerCZ = 0;
+        int centerRX = INT_MIN, centerRZ = INT_MIN;
         int64_t slotKeys[LOAD_CHUNKS][LOAD_CHUNKS];
-        std::deque<std::pair<int, int>> uploadQueue;
+
+        std::deque<std::pair<int, int>> genQueue;       // CPU terrain generation
+        std::deque<std::pair<int, int>> uploadQueue;     // GPU atlas upload
 
         void init() {
+            centerRX = centerRZ = INT_MIN;
             for (auto& row : slotKeys)
                 for (auto& k : row) k = INT64_MIN;
         }
@@ -249,27 +257,57 @@ static uint8_t SurfaceHeightAt(float wx, float wz) {
 // ===================================================================
 //  Chunk streaming – determine which chunks to load/unload
 // ===================================================================
-static std::vector<std::pair<int, int>> UpdateLoadedArea(int newCX, int newCZ) {
-    std::vector<std::pair<int, int>> need;
-    int minCX = newCX - LOAD_CHUNKS / 2, maxCX = newCX + LOAD_CHUNKS / 2;
-    int minCZ = newCZ - LOAD_CHUNKS / 2, maxCZ = newCZ + LOAD_CHUNKS / 2;
+static constexpr int REGION_BLOCK_SHIFT = 8;   // log2(REGION_CHUNKS * CHUNK_X) = log2(256)
 
-    for (int cx = minCX; cx < maxCX; ++cx) {
-        for (int cz = minCZ; cz < maxCZ; ++cz) {
-            int64_t key = ChunkKey(cx, cz);
-            if (cm.chunks.find(key) == cm.chunks.end())
-                GenerateChunkTerrain(cx, cz);
+static int BlockToRegion(int b) { return b >> REGION_BLOCK_SHIFT; }
 
-            int sx = AtlasSlot(cx), sz = AtlasSlot(cz);
-            if (cm.slotKeys[sx][sz] != key) {
-                cm.slotKeys[sx][sz] = key;
-                need.push_back({ cx, cz });
+static bool RegionInBounds(int rx, int rz, int cRX, int cRZ) {
+    return rx >= cRX - 1 && rx <= cRX + 1 &&
+        rz >= cRZ - 1 && rz <= cRZ + 1;
+}
+
+static void UpdateLoadedArea(int newRX, int newRZ) {
+    int oldRX = cm.centerRX, oldRZ = cm.centerRZ;
+
+    // ---- Evict regions that left the 3×3 boundary (immediate) ----
+    if (oldRX != INT_MIN) {
+        for (int rx = oldRX - 1; rx <= oldRX + 1; ++rx) {
+            for (int rz = oldRZ - 1; rz <= oldRZ + 1; ++rz) {
+                if (RegionInBounds(rx, rz, newRX, newRZ)) continue;
+
+                int cxMin = rx * REGION_CHUNKS;
+                int czMin = rz * REGION_CHUNKS;
+                for (int cx = cxMin; cx < cxMin + REGION_CHUNKS; ++cx) {
+                    for (int cz = czMin; cz < czMin + REGION_CHUNKS; ++cz) {
+                        int sx = AtlasSlot(cx), sz = AtlasSlot(cz);
+                        int64_t key = ChunkKey(cx, cz);
+                        if (cm.slotKeys[sx][sz] == key)
+                            cm.slotKeys[sx][sz] = INT64_MIN;
+                        cm.chunks.erase(key);
+                    }
+                }
             }
         }
     }
-    cm.centerCX = newCX;
-    cm.centerCZ = newCZ;
-    return need;
+
+    // ---- Queue generation for missing chunks (deferred) ----
+    for (int rx = newRX - 1; rx <= newRX + 1; ++rx) {
+        for (int rz = newRZ - 1; rz <= newRZ + 1; ++rz) {
+            int cxMin = rx * REGION_CHUNKS;
+            int czMin = rz * REGION_CHUNKS;
+            for (int cx = cxMin; cx < cxMin + REGION_CHUNKS; ++cx) {
+                for (int cz = czMin; cz < czMin + REGION_CHUNKS; ++cz) {
+                    int64_t key = ChunkKey(cx, cz);
+                    if (cm.chunks.find(key) == cm.chunks.end()) {
+                        cm.genQueue.push_back({ cx, cz });
+                    }
+                }
+            }
+        }
+    }
+
+    cm.centerRX = newRX;
+    cm.centerRZ = newRZ;
 }
 
 static void EnqueueUploads(const std::vector<std::pair<int, int>>& list) {
@@ -277,17 +315,109 @@ static void EnqueueUploads(const std::vector<std::pair<int, int>>& list) {
         cm.uploadQueue.push_back(p);
 }
 
+static void EvictRegion(int rx, int rz) {
+    int cxMin = rx * REGION_CHUNKS, czMin = rz * REGION_CHUNKS;
+    for (int cx = cxMin; cx < cxMin + REGION_CHUNKS; ++cx)
+        for (int cz = czMin; cz < czMin + REGION_CHUNKS; ++cz) {
+            int64_t key = ChunkKey(cx, cz);
+            int sx = AtlasSlot(cx), sz = AtlasSlot(cz);
+            if (cm.slotKeys[sx][sz] == key)
+                cm.slotKeys[sx][sz] = INT64_MIN;
+            cm.chunks.erase(key);
+        }
+}
+
+static void ScheduleRegionTransition(int newRX, int newRZ) {
+    int oldRX = cm.centerRX, oldRZ = cm.centerRZ;
+
+    // Discard stale generation work from any prior incomplete transition
+    cm.genQueue.clear();
+
+    // ---- Evict regions that left the 3×3 (fast: hashmap erase only) ----
+    if (oldRX != INT_MIN) {
+        for (int rx = oldRX - 1; rx <= oldRX + 1; ++rx)
+            for (int rz = oldRZ - 1; rz <= oldRZ + 1; ++rz)
+                if (!RegionInBounds(rx, rz, newRX, newRZ))
+                    EvictRegion(rx, rz);
+    }
+
+    // ---- Update center immediately so shader bounds are correct ----
+    cm.centerRX = newRX;
+    cm.centerRZ = newRZ;
+
+    // ---- Queue work for the full new 3×3 ----
+    for (int rx = newRX - 1; rx <= newRX + 1; ++rx)
+        for (int rz = newRZ - 1; rz <= newRZ + 1; ++rz) {
+            int cxMin = rx * REGION_CHUNKS;
+            int czMin = rz * REGION_CHUNKS;
+            for (int cx = cxMin; cx < cxMin + REGION_CHUNKS; ++cx)
+                for (int cz = czMin; cz < czMin + REGION_CHUNKS; ++cz) {
+                    int64_t key = ChunkKey(cx, cz);
+                    if (cm.chunks.count(key)) {
+                        // Retained from overlap — just ensure atlas slot is current
+                        int sx = AtlasSlot(cx), sz = AtlasSlot(cz);
+                        if (cm.slotKeys[sx][sz] != key) {
+                            cm.slotKeys[sx][sz] = key;
+                            cm.uploadQueue.push_back({ cx, cz });
+                        }
+                    }
+                    else {
+                        // Needs CPU generation (deferred)
+                        cm.genQueue.push_back({ cx, cz });
+                    }
+                }
+        }
+}
+
+static void ProcessGenQueue() {
+    int done = 0;
+    while (done < MAX_GENS_PER_FRAME && !cm.genQueue.empty()) {
+        auto [cx, cz] = cm.genQueue.front();
+        cm.genQueue.pop_front();
+
+        // Skip if no longer needed (rapid successive transitions)
+        int crx = ChunkToRegion(cx), crz = ChunkToRegion(cz);
+        if (!RegionInBounds(crx, crz, cm.centerRX, cm.centerRZ))
+            continue;
+
+        // Skip if already generated (overlap with retained region)
+        int64_t key = ChunkKey(cx, cz);
+        if (cm.chunks.count(key))
+            continue;
+
+        GenerateChunkTerrain(cx, cz);
+
+        int sx = AtlasSlot(cx), sz = AtlasSlot(cz);
+        cm.slotKeys[sx][sz] = key;
+        cm.uploadQueue.push_back({ cx, cz });
+        ++done;
+    }
+}
+
 // ===================================================================
 //  GenerateTerrain – called from Demo.cpp before InitD3D12
 // ===================================================================
 void GenerateTerrain() {
     cm.init();
-    int pcx = int(std::floor(gApp.camX)) >> 5;
-    int pcz = int(std::floor(gApp.camY)) >> 5;
-    auto need = UpdateLoadedArea(pcx, pcz);
-    EnqueueUploads(need);
+    int prx = BlockToRegion(int(std::floor(gApp.camX)));
+    int prz = BlockToRegion(int(std::floor(gApp.camY)));
 
-    // Set initial camera height
+    cm.centerRX = prx;
+    cm.centerRZ = prz;
+
+    // Synchronous: all 576 chunks generated before first frame
+    for (int rx = prx - 1; rx <= prx + 1; ++rx)
+        for (int rz = prz - 1; rz <= prz + 1; ++rz) {
+            int cxMin = rx * REGION_CHUNKS, czMin = rz * REGION_CHUNKS;
+            for (int cx = cxMin; cx < cxMin + REGION_CHUNKS; ++cx)
+                for (int cz = czMin; cz < czMin + REGION_CHUNKS; ++cz) {
+                    GenerateChunkTerrain(cx, cz);
+                    int sx = AtlasSlot(cx), sz = AtlasSlot(cz);
+                    cm.slotKeys[sx][sz] = ChunkKey(cx, cz);
+                    cm.uploadQueue.push_back({ cx, cz });
+                }
+        }
+
     float sh = float(SurfaceHeightAt(gApp.camX, gApp.camY));
     gApp.camZ = sh + 2.5f;
 }
@@ -758,37 +888,42 @@ void InitD3D12(HWND hwnd) {
 //  Render  (streaming uploads + dispatch + present)
 // ===================================================================
 void Render() {
-    // ---- Chunk streaming: check if player crossed chunk boundary ----
-    int pcx = int(std::floor(gApp.camX)) >> 5;
-    int pcz = int(std::floor(gApp.camY)) >> 5;
-    if (pcx != cm.centerCX || pcz != cm.centerCZ) {
-        auto need = UpdateLoadedArea(pcx, pcz);
-        EnqueueUploads(need);
-    }
+    // ---- Region boundary check ----
+    int prx = BlockToRegion(int(std::floor(gApp.camX)));
+    int prz = BlockToRegion(int(std::floor(gApp.camY)));
+    if (prx != cm.centerRX || prz != cm.centerRZ)
+        ScheduleRegionTransition(prx, prz);
+
+    // ---- Amortised CPU generation (before command list recording) ----
+    ProcessGenQueue();
 
     auto* alloc = gpu.cmdAlloc[gpu.frameIndex].Get();
     Check(alloc->Reset(), "AR");
     Check(gpu.cmdList->Reset(alloc, gpu.pso.Get()), "LR");
 
-    // ---- Per-frame chunk uploads ----
-    int uploadsThisFrame = std::min(int(cm.uploadQueue.size()), MAX_UPLOADS_PER_FRAME);
-    if (uploadsThisFrame > 0) {
+    // ---- Per-frame chunk uploads (skip stale entries) ----
+    std::vector<std::pair<int, int>> batch;
+    {
         uint8_t* mapped = gpu.frameStagingMapped[gpu.frameIndex];
-        std::vector<std::pair<int, int>> batch(uploadsThisFrame);
-        for (int i = 0; i < uploadsThisFrame; ++i) {
-            batch[i] = cm.uploadQueue.front();
+        int uploaded = 0;
+        while (uploaded < MAX_UPLOADS_PER_FRAME && !cm.uploadQueue.empty()) {
+            auto [cx, cz] = cm.uploadQueue.front();
             cm.uploadQueue.pop_front();
-            auto it = cm.chunks.find(ChunkKey(batch[i].first, batch[i].second));
-            if (it != cm.chunks.end())
-                FlattenChunk(it->second, mapped + size_t(i) * CHUNK_STAGING);
+            auto it = cm.chunks.find(ChunkKey(cx, cz));
+            if (it == cm.chunks.end()) continue;
+            FlattenChunk(it->second, mapped + size_t(uploaded) * CHUNK_STAGING);
+            batch.push_back({ cx, cz });
+            ++uploaded;
         }
+    }
 
+    if (!batch.empty()) {
         auto bPre = Transition(gpu.atlas.Get(),
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
             D3D12_RESOURCE_STATE_COPY_DEST);
         gpu.cmdList->ResourceBarrier(1, &bPre);
 
-        for (int i = 0; i < uploadsThisFrame; ++i)
+        for (size_t i = 0; i < batch.size(); ++i)
             RecordChunkCopy(gpu.cmdList.Get(),
                 gpu.frameStaging[gpu.frameIndex].Get(),
                 UINT64(i) * CHUNK_STAGING,
@@ -800,11 +935,10 @@ void Render() {
         gpu.cmdList->ResourceBarrier(1, &bPost);
     }
 
-    // ---- Build frame constants ----
+    // ---- Frame constants (unchanged from previous version) ----
     float cosP = std::cos(gApp.pitch), sinP = std::sin(gApp.pitch);
     float cosA = std::cos(gApp.angle), sinA = std::sin(gApp.angle);
 
-    int halfLC = LOAD_CHUNKS / 2;
     FrameConstants fc{};
     fc.camPos[0] = gApp.camX;
     fc.camPos[1] = gApp.camZ;
@@ -814,15 +948,15 @@ void Render() {
     fc.up[0] = -sinP * cosA; fc.up[1] = cosP;  fc.up[2] = -sinP * sinA;
     fc.screenW = UINT(gApp.width);
     fc.screenH = UINT(gApp.height);
-    fc.loadMinCX = cm.centerCX - halfLC;
-    fc.loadMinCZ = cm.centerCZ - halfLC;
-    fc.loadMaxCX = cm.centerCX + halfLC;
-    fc.loadMaxCZ = cm.centerCZ + halfLC;
+    fc.loadMinCX = (cm.centerRX - 1) * REGION_CHUNKS;
+    fc.loadMinCZ = (cm.centerRZ - 1) * REGION_CHUNKS;
+    fc.loadMaxCX = (cm.centerRX + 2) * REGION_CHUNKS;
+    fc.loadMaxCZ = (cm.centerRZ + 2) * REGION_CHUNKS;
     fc.tanHalfFov = 0.8f;
     fc.maxDist = 300.0f;
     std::memcpy(gpu.cbMapped + gpu.frameIndex * CB_ALIGN, &fc, sizeof(fc));
 
-    // ---- Dispatch ----
+    // ---- Dispatch + present (identical to previous) ----
     gpu.cmdList->SetComputeRootSignature(gpu.rootSig.Get());
     ID3D12DescriptorHeap* heaps[] = { gpu.srvHeap.Get() };
     gpu.cmdList->SetDescriptorHeaps(1, heaps);
@@ -833,7 +967,6 @@ void Render() {
 
     gpu.cmdList->Dispatch((gApp.width + 7) / 8, (gApp.height + 7) / 8, 1);
 
-    // ---- Copy output -> back buffer ----
     D3D12_RESOURCE_BARRIER pre[2] = {
         Transition(gpu.outputTex.Get(),
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
