@@ -39,6 +39,11 @@ static constexpr UINT  CHUNK_STAGING = STAGING_SLICE * CHUNK_Z;    // 1 048 576
 static constexpr int   MAX_UPLOADS_PER_FRAME = 8;
 static constexpr UINT  FRAME_STAGING_SIZE = MAX_UPLOADS_PER_FRAME * CHUNK_STAGING;
 
+// ---- Occupancy-map staging (one 1×SECTIONS_PER_CHUNK×1 column per chunk) ----
+static constexpr UINT  OCC_ROW = 256;                                        // D3D12 row-pitch alignment
+static constexpr UINT  CHUNK_OCC_STAGING = OCC_ROW * SECTIONS_PER_CHUNK;     // 2048 – also 512-aligned for placement
+static constexpr UINT  FRAME_OCC_STAGING_SIZE = MAX_UPLOADS_PER_FRAME * CHUNK_OCC_STAGING;
+
 static constexpr int MAX_GENS_PER_FRAME = 16;
 static constexpr int REGION_CHUNK_SHIFT = 3;     // log2(REGION_CHUNKS)
 
@@ -148,14 +153,19 @@ static struct GpuState {
     ComPtr<ID3D12PipelineState>  pso;
 
     ComPtr<ID3D12Resource> atlas;                   // Texture3D 768×128×768
+    ComPtr<ID3D12Resource> occupancy;               // Texture3D  24×  8× 24  (section occupancy)
     ComPtr<ID3D12Resource> outputTex;
     ComPtr<ID3D12Resource> backBuffers[FRAME_COUNT];
     ComPtr<ID3D12Resource> cbUpload;
-    ComPtr<ID3D12Resource> zeroStaging;            // 1 chunk, permanently zeroed
+    ComPtr<ID3D12Resource> zeroStaging;             // 1 chunk, permanently zeroed
+    ComPtr<ID3D12Resource> zeroOccStaging;          // 1 occupancy column, permanently zeroed
     uint8_t* cbMapped = nullptr;
 
     ComPtr<ID3D12Resource> frameStaging[FRAME_COUNT];
     uint8_t* frameStagingMapped[FRAME_COUNT]{};
+
+    ComPtr<ID3D12Resource> frameOccStaging[FRAME_COUNT];
+    uint8_t* frameOccStagingMapped[FRAME_COUNT]{};
 } gpu;
 
 // ===================================================================
@@ -451,7 +461,20 @@ static void FlattenChunk(const Chunk& c, uint8_t* dst) {
 }
 
 // ===================================================================
-//  HLSL compute shader – 3-D DDA through toroidal atlas
+//  Flatten chunk section-occupancy into staging-buffer layout.
+//  Footprint is 1 × SECTIONS_PER_CHUNK × 1 with RowPitch = OCC_ROW, so
+//  section si lives at byte offset si * OCC_ROW.
+// ===================================================================
+static void FlattenOccupancy(const Chunk& c, uint8_t* dst) {
+    std::memset(dst, 0, CHUNK_OCC_STAGING);
+    for (int si = 0; si < SECTIONS_PER_CHUNK; ++si)
+        dst[size_t(si) * OCC_ROW] = c.sections[si] ? 1u : 0u;
+}
+
+// ===================================================================
+//  HLSL compute shader – two-level (section / voxel) DDA through
+//  toroidal atlas, using a section-occupancy map to skip empty
+//  32×16×32 regions in a single step.
 // ===================================================================
 static const char* g_shaderSrc = R"(
 cbuffer CB : register(b0)
@@ -466,13 +489,22 @@ cbuffer CB : register(b0)
     float  tanHalfFov, maxDist;
 };
 
-Texture3D<uint>     Atlas  : register(t0);
-RWTexture2D<float4> Output : register(u0);
+Texture3D<uint>     Atlas     : register(t0);   // 768 x 128 x 768 voxels
+Texture3D<uint>     Occupancy : register(t1);   //  24 x   8 x  24 section flags
+RWTexture2D<float4> Output    : register(u0);
 
-static const int   MAX_STEPS = 512;
-static const int   LC = 24;
-static const int   CX = 32;
-static const int   CY = 128;
+static const int   LC   = 24;          // LOAD_CHUNKS
+static const int   CX   = 32;          // CHUNK_X / CHUNK_Z
+static const int   CY   = 128;         // CHUNK_Y
+static const int   SY   = 16;          // SECTION_Y   (coarse cell height)
+static const int   SPC  = 8;           // SECTIONS_PER_CHUNK = CY / SY
+
+static const int3   SEC_I = int3(CX, SY, CX);          // coarse cell size (int)
+static const float3 SEC_F = float3(32.0, 16.0, 32.0);  // coarse cell size (float)
+
+static const int   MAX_COARSE = 64;    // enough for maxDist=300 at 32/16/32 cells
+static const int   MAX_FINE   = 96;    // >= 32+16+32 voxels through one section
+
 static const float3 FOG_CLR = float3(0.67, 0.80, 0.92);
 
 static const float3 bcolors[9] = {
@@ -490,6 +522,23 @@ static const float faceBri[6] = { 0.80, 0.80, 1.00, 0.45, 0.65, 0.65 };
 
 uint PosMod(int v, int m) { return uint(((v % m) + m) % m); }
 
+// Arithmetic >> on signed int == floor-division by power of two, so this is
+// correct for negative world coordinates.
+int3 SectionOf(int3 p) { return int3(p.x >> 5, p.y >> 4, p.z >> 5); }
+
+// Distance along the ray from 'origin' to the exit face of integer cell 'cell'
+// of size 'cellSize', given step signs 'st' and per-axis |1/rd| in 'tD'.
+float3 InitTMax(int3 cell, float3 cellSize, float3 origin, int3 st, float3 tD)
+{
+    float3 lo = float3(cell) * cellSize;
+    float3 hi = lo + cellSize;
+    float3 d;
+    d.x = (st.x > 0) ? (hi.x - origin.x) : (origin.x - lo.x);
+    d.y = (st.y > 0) ? (hi.y - origin.y) : (origin.y - lo.y);
+    d.z = (st.z > 0) ? (hi.z - origin.z) : (origin.z - lo.z);
+    return d * tD;
+}
+
 uint GetBlock(int3 wp)
 {
     if (wp.y < 0 || wp.y >= CY) return 0u;
@@ -502,6 +551,20 @@ uint GetBlock(int3 wp)
     uint lx = uint(wp.x) & 31u;
     uint lz = uint(wp.z) & 31u;
     return Atlas.Load(int4(sx * CX + lx, wp.y, sz * CX + lz, 0));
+}
+
+// sc.x / sc.z are section indices which equal chunk indices (cell is full
+// chunk width in XZ), so the same load-window test and PosMod wrap apply.
+uint GetOccupancy(int3 sc)
+{
+    if (sc.y < 0 || sc.y >= SPC) return 0u;
+    int cx = sc.x;
+    int cz = sc.z;
+    if (cx < loadMinCX || cx >= loadMaxCX ||
+        cz < loadMinCZ || cz >= loadMaxCZ) return 0u;
+    uint sx = PosMod(cx, LC);
+    uint sz = PosMod(cz, LC);
+    return Occupancy.Load(int4(sx, sc.y, sz, 0));
 }
 
 uint BHash(int3 p)
@@ -530,30 +593,88 @@ void CSMain(uint3 tid : SV_DispatchThreadID)
     float py  = (1.0-2.0*(float(tid.y)+0.5)/float(screenH)) * tanHalfFov;
     float3 rd = normalize(camFwd + camRight*px + camUp*py);
 
-    int3   mp   = int3(floor(camPos));
-    int3   st   = int3(rd.x>=0?1:-1, rd.y>=0?1:-1, rd.z>=0?1:-1);
-    float3 tD   = abs(1.0/rd);
-    float3 tM;
-    tM.x = ((rd.x>=0)?(float(mp.x+1)-camPos.x):(camPos.x-float(mp.x)))*tD.x;
-    tM.y = ((rd.y>=0)?(float(mp.y+1)-camPos.y):(camPos.y-float(mp.y)))*tD.y;
-    tM.z = ((rd.z>=0)?(float(mp.z+1)-camPos.z):(camPos.z-float(mp.z)))*tD.z;
+    int3   st = int3(rd.x>=0?1:-1, rd.y>=0?1:-1, rd.z>=0?1:-1);
+    float3 tD = abs(1.0/rd);
 
-    float dist = 0; int face = -1; bool hit = false;
+    // ---- Fine (voxel) DDA state – seeded at the camera ----
+    int3   mp = int3(floor(camPos));
+    float3 tM = InitTMax(mp, float3(1,1,1), camPos, st, tD);
 
-    [loop] for (int i = 0; i < MAX_STEPS; ++i)
+    // ---- Coarse (section) DDA state – derived from the camera voxel ----
+    int3   sc  = SectionOf(mp);
+    float3 tDC = SEC_F * tD;
+    float3 tMC = InitTMax(sc, SEC_F, camPos, st, tD);
+
+    float dist = 0.0;
+    int   face = -1;
+    bool  hit  = false;
+
+    bool  fineValid = true;   // mp/tM currently describe the voxel at 'dist'
+    bool  skipFirst = true;   // match original: never test the camera's own voxel
+
+    [loop] for (int ci = 0; ci < MAX_COARSE; ++ci)
     {
-        if (tM.x < tM.y) {
-            if (tM.x < tM.z) { dist=tM.x; tM.x+=tD.x; mp.x+=st.x; face=st.x>0?1:0; }
-            else              { dist=tM.z; tM.z+=tD.z; mp.z+=st.z; face=st.z>0?5:4; }
-        } else {
-            if (tM.y < tM.z) { dist=tM.y; tM.y+=tD.y; mp.y+=st.y; face=st.y>0?3:2; }
-            else              { dist=tM.z; tM.z+=tD.z; mp.z+=st.z; face=st.z>0?5:4; }
-        }
         if (dist > maxDist) break;
-        if (mp.y < 0) break;
-        if (mp.y >= CY) continue;
-        uint bt = GetBlock(mp);
-        if (bt != 0u) { hit = true; break; }
+        if (sc.y <  0   && st.y < 0) break;   // below bedrock, still descending
+        if (sc.y >= SPC && st.y > 0) break;   // above world, still ascending
+
+        if (GetOccupancy(sc) != 0u)
+        {
+            // ---- Occupied section: fine-grained DDA inside it ----
+            int3 lo = sc * SEC_I;
+            int3 hi = lo + SEC_I - int3(1,1,1);
+
+            if (!fineValid) {
+                // Re-seed fine DDA at the ray's entry point into this section.
+                // 'dist' / 'face' were set by the coarse step that brought us here.
+                float3 p = camPos + rd * dist;
+                mp = clamp(int3(floor(p)), lo, hi);   // clamp absorbs boundary fp error
+                tM = InitTMax(mp, float3(1,1,1), camPos, st, tD);
+                fineValid = true;
+            }
+
+            [loop] for (int fi = 0; fi < MAX_FINE; ++fi)
+            {
+                if (!skipFirst) {
+                    uint bt = GetBlock(mp);
+                    if (bt != 0u) { hit = true; break; }
+                }
+                skipFirst = false;
+
+                if (tM.x < tM.y) {
+                    if (tM.x < tM.z) { dist=tM.x; tM.x+=tD.x; mp.x+=st.x; face=st.x>0?1:0; }
+                    else             { dist=tM.z; tM.z+=tD.z; mp.z+=st.z; face=st.z>0?5:4; }
+                } else {
+                    if (tM.y < tM.z) { dist=tM.y; tM.y+=tD.y; mp.y+=st.y; face=st.y>0?3:2; }
+                    else             { dist=tM.z; tM.z+=tD.z; mp.z+=st.z; face=st.z>0?5:4; }
+                }
+
+                if (dist > maxDist) break;
+                if (any(mp < lo) || any(mp > hi)) break;   // stepped out of this section
+            }
+            if (hit || dist > maxDist) break;
+
+            // Fine walk has stepped into the neighbouring section; resync the
+            // coarse cursor from the authoritative fine position so the two
+            // grids can never drift apart.
+            sc  = SectionOf(mp);
+            tMC = InitTMax(sc, SEC_F, camPos, st, tD);
+            // fineValid stays true: mp/tM already describe the entry voxel of 'sc'.
+        }
+        else
+        {
+            // ---- Empty section: one coarse DDA step skips the whole cell ----
+            skipFirst = false;
+
+            if (tMC.x < tMC.y) {
+                if (tMC.x < tMC.z) { dist=tMC.x; tMC.x+=tDC.x; sc.x+=st.x; face=st.x>0?1:0; }
+                else               { dist=tMC.z; tMC.z+=tDC.z; sc.z+=st.z; face=st.z>0?5:4; }
+            } else {
+                if (tMC.y < tMC.z) { dist=tMC.y; tMC.y+=tDC.y; sc.y+=st.y; face=st.y>0?3:2; }
+                else               { dist=tMC.z; tMC.z+=tDC.z; sc.z+=st.z; face=st.z>0?5:4; }
+            }
+            fineValid = false;   // mp/tM are stale; will be reseeded on next occupied cell.
+        }
     }
 
     float4 color;
@@ -675,6 +796,33 @@ static void RecordChunkCopy(ID3D12GraphicsCommandList* cl,
     cl->CopyTextureRegion(&dst, UINT(ax), 0, UINT(az), &src, nullptr);
 }
 
+// Record a CopyTextureRegion for one chunk's occupancy column
+// (1 × SECTIONS_PER_CHUNK × 1) into the occupancy map.
+static void RecordOccCopy(ID3D12GraphicsCommandList* cl,
+    ID3D12Resource* staging, UINT64 stagingOffset,
+    ID3D12Resource* occ, int cx, int cz) {
+
+    int ax = AtlasSlot(cx);
+    int az = AtlasSlot(cz);
+
+    D3D12_TEXTURE_COPY_LOCATION src{};
+    src.pResource = staging;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint.Offset = stagingOffset;
+    src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8_UINT;
+    src.PlacedFootprint.Footprint.Width = 1;
+    src.PlacedFootprint.Footprint.Height = SECTIONS_PER_CHUNK;
+    src.PlacedFootprint.Footprint.Depth = 1;
+    src.PlacedFootprint.Footprint.RowPitch = OCC_ROW;
+
+    D3D12_TEXTURE_COPY_LOCATION dst{};
+    dst.pResource = occ;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.SubresourceIndex = 0;
+
+    cl->CopyTextureRegion(&dst, UINT(ax), 0, UINT(az), &src, nullptr);
+}
+
 // ===================================================================
 //  Size-dependent resources
 // ===================================================================
@@ -684,8 +832,9 @@ static void CreateSizeDependentResources() {
         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
+    // Heap layout: [0]=atlas SRV, [1]=occupancy SRV, [2]=output UAV
     D3D12_CPU_DESCRIPTOR_HANDLE h = gpu.srvHeap->GetCPUDescriptorHandleForHeapStart();
-    h.ptr += gpu.srvDescSize;
+    h.ptr += 2 * gpu.srvDescSize;
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
     uav.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
@@ -713,15 +862,18 @@ void ResizeBackbuffer(int w, int h) {
 
 // ===================================================================
 //  Upload a batch of chunks (blocking).  Used during init.
+//  Uploads both voxel data (atlas) and section occupancy (occupancy map).
 // ===================================================================
 static void UploadChunkBatch(const std::vector<std::pair<int, int>>& batch) {
     if (batch.empty()) return;
 
     uint8_t* mapped = gpu.frameStagingMapped[0];
+    uint8_t* occMapped = gpu.frameOccStagingMapped[0];
     for (size_t i = 0; i < batch.size(); ++i) {
         auto [cx, cz] = batch[i];
         auto it = cm.chunks.find(ChunkKey(cx, cz));
         FlattenChunk(it->second, mapped + i * CHUNK_STAGING);
+        FlattenOccupancy(it->second, occMapped + i * CHUNK_OCC_STAGING);
     }
 
     Check(gpu.cmdAlloc[0]->Reset(), "AR");
@@ -731,6 +883,8 @@ static void UploadChunkBatch(const std::vector<std::pair<int, int>>& batch) {
         auto [cx, cz] = batch[i];
         RecordChunkCopy(gpu.cmdList.Get(), gpu.frameStaging[0].Get(),
             i * CHUNK_STAGING, gpu.atlas.Get(), cx, cz);
+        RecordOccCopy(gpu.cmdList.Get(), gpu.frameOccStaging[0].Get(),
+            i * CHUNK_OCC_STAGING, gpu.occupancy.Get(), cx, cz);
     }
 
     Check(gpu.cmdList->Close(), "Cl");
@@ -772,9 +926,9 @@ void InitD3D12(HWND hwnd) {
     Check(sc1.As(&gpu.swapChain), "SC3");
     gpu.frameIndex = gpu.swapChain->GetCurrentBackBufferIndex();
 
-    // Descriptor heap: [0]=atlas SRV, [1]=output UAV
+    // Descriptor heap: [0]=atlas SRV, [1]=occupancy SRV, [2]=output UAV
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
-    hd.NumDescriptors = 2;
+    hd.NumDescriptors = 3;
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     Check(gpu.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&gpu.srvHeap)), "Hp");
@@ -794,14 +948,14 @@ void InitD3D12(HWND hwnd) {
     gpu.fenceValues[gpu.frameIndex] = 1;
     gpu.fenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
 
-    // ---- Root signature: [0] CBV b0, [1] table {t0, u0} ----
+    // ---- Root signature: [0] CBV b0, [1] table {t0, t1, u0} ----
     D3D12_DESCRIPTOR_RANGE rng[2]{};
     rng[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    rng[0].NumDescriptors = 1; rng[0].BaseShaderRegister = 0;
+    rng[0].NumDescriptors = 2; rng[0].BaseShaderRegister = 0;           // t0, t1
     rng[0].OffsetInDescriptorsFromTableStart = 0;
     rng[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-    rng[1].NumDescriptors = 1; rng[1].BaseShaderRegister = 0;
-    rng[1].OffsetInDescriptorsFromTableStart = 1;
+    rng[1].NumDescriptors = 1; rng[1].BaseShaderRegister = 0;           // u0
+    rng[1].OffsetInDescriptorsFromTableStart = 2;
 
     D3D12_ROOT_PARAMETER par[2]{};
     par[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -838,19 +992,27 @@ void InitD3D12(HWND hwnd) {
     gpu.cbUpload = CreateUploadBuffer(FRAME_COUNT * CB_ALIGN);
     Check(gpu.cbUpload->Map(0, nullptr, reinterpret_cast<void**>(&gpu.cbMapped)), "MCB");
 
-    // ---- Per-frame staging buffers ----
+    // ---- Per-frame staging buffers (voxel + occupancy) ----
     for (UINT i = 0; i < FRAME_COUNT; ++i) {
         gpu.frameStaging[i] = CreateUploadBuffer(FRAME_STAGING_SIZE);
         Check(gpu.frameStaging[i]->Map(0, nullptr,
             reinterpret_cast<void**>(&gpu.frameStagingMapped[i])), "MS");
+
+        gpu.frameOccStaging[i] = CreateUploadBuffer(FRAME_OCC_STAGING_SIZE);
+        Check(gpu.frameOccStaging[i]->Map(0, nullptr,
+            reinterpret_cast<void**>(&gpu.frameOccStagingMapped[i])), "MOS");
     }
 
-    // ---- Atlas (COPY_DEST initially for bulk upload) ----
+    // ---- Atlas + Occupancy (COPY_DEST initially for bulk upload) ----
     gpu.atlas = CreateDefaultTex3D(DXGI_FORMAT_R8_UINT,
         ATLAS_XZ, CHUNK_Y, ATLAS_XZ,
         D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
 
-    // ---- Bulk upload all queued chunks ----
+    gpu.occupancy = CreateDefaultTex3D(DXGI_FORMAT_R8_UINT,
+        LOAD_CHUNKS, SECTIONS_PER_CHUNK, LOAD_CHUNKS,
+        D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+
+    // ---- Bulk upload all queued chunks (voxels + occupancy) ----
     {
         std::vector<std::pair<int, int>> batch;
         batch.reserve(MAX_UPLOADS_PER_FRAME);
@@ -864,14 +1026,19 @@ void InitD3D12(HWND hwnd) {
         }
     }
 
-    // Transition atlas COPY_DEST -> NON_PIXEL_SHADER_RESOURCE
+    // Transition atlas + occupancy COPY_DEST -> NON_PIXEL_SHADER_RESOURCE
     {
         Check(gpu.cmdAlloc[0]->Reset(), "AR");
         Check(gpu.cmdList->Reset(gpu.cmdAlloc[0].Get(), nullptr), "LR");
-        auto b = Transition(gpu.atlas.Get(),
-            D3D12_RESOURCE_STATE_COPY_DEST,
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        gpu.cmdList->ResourceBarrier(1, &b);
+        D3D12_RESOURCE_BARRIER b[2] = {
+            Transition(gpu.atlas.Get(),
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            Transition(gpu.occupancy.Get(),
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
+        };
+        gpu.cmdList->ResourceBarrier(2, b);
         Check(gpu.cmdList->Close(), "Cl");
         ID3D12CommandList* ls[] = { gpu.cmdList.Get() };
         gpu.queue->ExecuteCommandLists(1, ls);
@@ -889,6 +1056,18 @@ void InitD3D12(HWND hwnd) {
         gpu.device->CreateShaderResourceView(gpu.atlas.Get(), &sv, h);
     }
 
+    // ---- Occupancy SRV (slot 1) ----
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE h = gpu.srvHeap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += gpu.srvDescSize;
+        D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+        sv.Format = DXGI_FORMAT_R8_UINT;
+        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sv.Texture3D.MipLevels = 1;
+        gpu.device->CreateShaderResourceView(gpu.occupancy.Get(), &sv, h);
+    }
+
     // ---- Zero staging for atlas clears (one chunk, zeroed once) ----
     gpu.zeroStaging = CreateUploadBuffer(CHUNK_STAGING);
     {
@@ -896,6 +1075,15 @@ void InitD3D12(HWND hwnd) {
         Check(gpu.zeroStaging->Map(0, nullptr, reinterpret_cast<void**>(&zp)), "MZ");
         std::memset(zp, 0, CHUNK_STAGING);
         gpu.zeroStaging->Unmap(0, nullptr);
+    }
+
+    // ---- Zero staging for occupancy clears (one column, zeroed once) ----
+    gpu.zeroOccStaging = CreateUploadBuffer(CHUNK_OCC_STAGING);
+    {
+        uint8_t* zp = nullptr;
+        Check(gpu.zeroOccStaging->Map(0, nullptr, reinterpret_cast<void**>(&zp)), "MZO");
+        std::memset(zp, 0, CHUNK_OCC_STAGING);
+        gpu.zeroOccStaging->Unmap(0, nullptr);
     }
 
     CreateSizeDependentResources();
@@ -922,6 +1110,7 @@ void Render() {
     std::vector<std::pair<int, int>> batch;
     {
         uint8_t* mapped = gpu.frameStagingMapped[gpu.frameIndex];
+        uint8_t* occMapped = gpu.frameOccStagingMapped[gpu.frameIndex];
         int uploaded = 0;
         while (uploaded < MAX_UPLOADS_PER_FRAME && !cm.uploadQueue.empty()) {
             auto [cx, cz] = cm.uploadQueue.front();
@@ -929,6 +1118,7 @@ void Render() {
             auto it = cm.chunks.find(ChunkKey(cx, cz));
             if (it == cm.chunks.end()) continue;
             FlattenChunk(it->second, mapped + size_t(uploaded) * CHUNK_STAGING);
+            FlattenOccupancy(it->second, occMapped + size_t(uploaded) * CHUNK_OCC_STAGING);
             batch.push_back({ cx, cz });
             ++uploaded;
         }
@@ -936,48 +1126,47 @@ void Render() {
 
     bool hasAtlasWork = !cm.clearQueue.empty() || !batch.empty();
     if (hasAtlasWork) {
-        auto bPre = Transition(gpu.atlas.Get(),
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-            D3D12_RESOURCE_STATE_COPY_DEST);
-        gpu.cmdList->ResourceBarrier(1, &bPre);
+        D3D12_RESOURCE_BARRIER bPre[2] = {
+            Transition(gpu.atlas.Get(),
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_COPY_DEST),
+            Transition(gpu.occupancy.Get(),
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_COPY_DEST)
+        };
+        gpu.cmdList->ResourceBarrier(2, bPre);
 
-        // Clears first: zero out evicted slots (all in one frame, no budget limit)
+        // Clears first: zero out evicted slots in BOTH atlas and occupancy.
         while (!cm.clearQueue.empty()) {
             auto [cx, cz] = cm.clearQueue.front();
             cm.clearQueue.pop_front();
             RecordChunkCopy(gpu.cmdList.Get(), gpu.zeroStaging.Get(), 0,
                 gpu.atlas.Get(), cx, cz);
+            RecordOccCopy(gpu.cmdList.Get(), gpu.zeroOccStaging.Get(), 0,
+                gpu.occupancy.Get(), cx, cz);
         }
 
-        // Then uploads: new chunk data overwrites cleared or stale slots
-        for (size_t i = 0; i < batch.size(); ++i)
+        // Then uploads: new chunk data + its occupancy column.
+        for (size_t i = 0; i < batch.size(); ++i) {
             RecordChunkCopy(gpu.cmdList.Get(),
                 gpu.frameStaging[gpu.frameIndex].Get(),
                 UINT64(i) * CHUNK_STAGING,
                 gpu.atlas.Get(), batch[i].first, batch[i].second);
+            RecordOccCopy(gpu.cmdList.Get(),
+                gpu.frameOccStaging[gpu.frameIndex].Get(),
+                UINT64(i) * CHUNK_OCC_STAGING,
+                gpu.occupancy.Get(), batch[i].first, batch[i].second);
+        }
 
-        auto bPost = Transition(gpu.atlas.Get(),
-            D3D12_RESOURCE_STATE_COPY_DEST,
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        gpu.cmdList->ResourceBarrier(1, &bPost);
-    }
-
-    if (!batch.empty()) {
-        auto bPre = Transition(gpu.atlas.Get(),
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-            D3D12_RESOURCE_STATE_COPY_DEST);
-        gpu.cmdList->ResourceBarrier(1, &bPre);
-
-        for (size_t i = 0; i < batch.size(); ++i)
-            RecordChunkCopy(gpu.cmdList.Get(),
-                gpu.frameStaging[gpu.frameIndex].Get(),
-                UINT64(i) * CHUNK_STAGING,
-                gpu.atlas.Get(), batch[i].first, batch[i].second);
-
-        auto bPost = Transition(gpu.atlas.Get(),
-            D3D12_RESOURCE_STATE_COPY_DEST,
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        gpu.cmdList->ResourceBarrier(1, &bPost);
+        D3D12_RESOURCE_BARRIER bPost[2] = {
+            Transition(gpu.atlas.Get(),
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            Transition(gpu.occupancy.Get(),
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
+        };
+        gpu.cmdList->ResourceBarrier(2, bPost);
     }
 
     // ---- Frame constants (unchanged from previous version) ----
@@ -1046,6 +1235,10 @@ void ShutdownD3D12() {
         if (gpu.frameStagingMapped[i]) {
             gpu.frameStaging[i]->Unmap(0, nullptr);
             gpu.frameStagingMapped[i] = nullptr;
+        }
+        if (gpu.frameOccStagingMapped[i]) {
+            gpu.frameOccStaging[i]->Unmap(0, nullptr);
+            gpu.frameOccStagingMapped[i] = nullptr;
         }
     }
     if (gpu.cbMapped) { gpu.cbUpload->Unmap(0, nullptr); gpu.cbMapped = nullptr; }
