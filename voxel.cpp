@@ -489,21 +489,21 @@ cbuffer CB : register(b0)
     float  tanHalfFov, maxDist;
 };
 
-Texture3D<uint>     Atlas     : register(t0);   // 768 x 128 x 768 voxels
-Texture3D<uint>     Occupancy : register(t1);   //  24 x   8 x  24 section flags
+Texture3D<uint>     Atlas     : register(t0);
+Texture3D<uint>     Occupancy : register(t1);
 RWTexture2D<float4> Output    : register(u0);
 
-static const int   LC   = 24;          // LOAD_CHUNKS
-static const int   CX   = 32;          // CHUNK_X / CHUNK_Z
-static const int   CY   = 128;         // CHUNK_Y
-static const int   SY   = 16;          // SECTION_Y   (coarse cell height)
-static const int   SPC  = 8;           // SECTIONS_PER_CHUNK = CY / SY
+static const int   LC   = 24;
+static const int   CX   = 32;
+static const int   CY   = 128;
+static const int   SY   = 16;
+static const int   SPC  = 8;
 
-static const int3   SEC_I = int3(CX, SY, CX);          // coarse cell size (int)
-static const float3 SEC_F = float3(32.0, 16.0, 32.0);  // coarse cell size (float)
+static const int3   SEC_I = int3(CX, SY, CX);
+static const float3 SEC_F = float3(32.0, 16.0, 32.0);
 
-static const int   MAX_COARSE = 64;    // enough for maxDist=300 at 32/16/32 cells
-static const int   MAX_FINE   = 96;    // >= 32+16+32 voxels through one section
+static const int   MAX_COARSE = 64;
+static const int   MAX_FINE   = 96;
 
 static const float3 FOG_CLR = float3(0.67, 0.80, 0.92);
 
@@ -520,14 +520,49 @@ static const float3 bcolors[9] = {
 };
 static const float faceBri[6] = { 0.80, 0.80, 1.00, 0.45, 0.65, 0.65 };
 
+// Outward surface normal per hit-face index.
+static const float3 faceN[6] = {
+    float3( 1, 0, 0), float3(-1, 0, 0),
+    float3( 0, 1, 0), float3( 0,-1, 0),
+    float3( 0, 0, 1), float3( 0, 0,-1)
+};
+// Deterministic axis-aligned tangent / bitangent per face.
+static const float3 faceT[6] = {
+    float3( 0, 0, 1), float3( 0, 0, 1),
+    float3( 1, 0, 0), float3( 1, 0, 0),
+    float3( 1, 0, 0), float3( 1, 0, 0)
+};
+static const float3 faceB[6] = {
+    float3( 0, 1, 0), float3( 0, 1, 0),
+    float3( 0, 0, 1), float3( 0, 0, 1),
+    float3( 0, 1, 0), float3( 0, 1, 0)
+};
+
+// ---- Ambient-occlusion parameters ----
+static const int   AO_SAMPLES  = 6;
+static const float AO_MAX_DIST = 12.0;
+static const float AO_BIAS     = 0.02;
+static const float AO_STRENGTH = 0.9;
+
+// 6 fixed hemisphere directions in tangent space (z = along normal).
+// Two interleaved rings: 3 @ 25 deg elevation (horizon / contact shadow)
+//                       + 3 @ 60 deg elevation (upper hemisphere / open sky).
+// Azimuths are offset 15 deg so no component is exactly 0; after the
+// axis-aligned {T,B,N} transform, no world-space AO ray component is 0
+// either, which sidesteps the 0*inf edge case in the DDA for all AO rays.
+static const float3 AO_DIRS[6] = {
+    float3( 0.87543,  0.23457, 0.42262),
+    float3(-0.64085,  0.64085, 0.42262),
+    float3(-0.23457, -0.87543, 0.42262),
+    float3( 0.12941,  0.48296, 0.86603),
+    float3(-0.48296, -0.12941, 0.86603),
+    float3( 0.35355, -0.35355, 0.86603)
+};
+
 uint PosMod(int v, int m) { return uint(((v % m) + m) % m); }
 
-// Arithmetic >> on signed int == floor-division by power of two, so this is
-// correct for negative world coordinates.
 int3 SectionOf(int3 p) { return int3(p.x >> 5, p.y >> 4, p.z >> 5); }
 
-// Distance along the ray from 'origin' to the exit face of integer cell 'cell'
-// of size 'cellSize', given step signs 'st' and per-axis |1/rd| in 'tD'.
 float3 InitTMax(int3 cell, float3 cellSize, float3 origin, int3 st, float3 tD)
 {
     float3 lo = float3(cell) * cellSize;
@@ -553,8 +588,6 @@ uint GetBlock(int3 wp)
     return Atlas.Load(int4(sx * CX + lx, wp.y, sz * CX + lz, 0));
 }
 
-// sc.x / sc.z are section indices which equal chunk indices (cell is full
-// chunk width in XZ), so the same load-window test and PosMod wrap apply.
 uint GetOccupancy(int3 sc)
 {
     if (sc.y < 0 || sc.y >= SPC) return 0u;
@@ -583,53 +616,46 @@ float3 BlockColor(uint bt, int face, int3 bp)
     return c * (1.0 + v);
 }
 
-[numthreads(8,8,1)]
-void CSMain(uint3 tid : SV_DispatchThreadID)
+// =================================================================
+//  Shared two-level (section/voxel) DDA.
+//  Identical control flow to the previously-inline traversal; only
+//  parameterised on origin / direction / max distance so it can be
+//  reused unchanged for both the primary ray and the AO secondaries.
+// =================================================================
+bool Trace(float3 ro, float3 rd, float maxT,
+           out float outDist, out int outFace, out int3 outVox)
 {
-    if (tid.x >= screenW || tid.y >= screenH) return;
-
-    float asp = float(screenW) / float(max(1u, screenH));
-    float px  = (2.0*(float(tid.x)+0.5)/float(screenW)-1.0) * asp * tanHalfFov;
-    float py  = (1.0-2.0*(float(tid.y)+0.5)/float(screenH)) * tanHalfFov;
-    float3 rd = normalize(camFwd + camRight*px + camUp*py);
-
     int3   st = int3(rd.x>=0?1:-1, rd.y>=0?1:-1, rd.z>=0?1:-1);
     float3 tD = abs(1.0/rd);
 
-    // ---- Fine (voxel) DDA state – seeded at the camera ----
-    int3   mp = int3(floor(camPos));
-    float3 tM = InitTMax(mp, float3(1,1,1), camPos, st, tD);
+    int3   mp = int3(floor(ro));
+    float3 tM = InitTMax(mp, float3(1,1,1), ro, st, tD);
 
-    // ---- Coarse (section) DDA state – derived from the camera voxel ----
     int3   sc  = SectionOf(mp);
     float3 tDC = SEC_F * tD;
-    float3 tMC = InitTMax(sc, SEC_F, camPos, st, tD);
+    float3 tMC = InitTMax(sc, SEC_F, ro, st, tD);
 
     float dist = 0.0;
     int   face = -1;
     bool  hit  = false;
-
-    bool  fineValid = true;   // mp/tM currently describe the voxel at 'dist'
-    bool  skipFirst = true;   // match original: never test the camera's own voxel
+    bool  fineValid = true;
+    bool  skipFirst = true;   // never test the origin's own voxel
 
     [loop] for (int ci = 0; ci < MAX_COARSE; ++ci)
     {
-        if (dist > maxDist) break;
-        if (sc.y <  0   && st.y < 0) break;   // below bedrock, still descending
-        if (sc.y >= SPC && st.y > 0) break;   // above world, still ascending
+        if (dist > maxT) break;
+        if (sc.y <  0   && st.y < 0) break;
+        if (sc.y >= SPC && st.y > 0) break;
 
         if (GetOccupancy(sc) != 0u)
         {
-            // ---- Occupied section: fine-grained DDA inside it ----
             int3 lo = sc * SEC_I;
             int3 hi = lo + SEC_I - int3(1,1,1);
 
             if (!fineValid) {
-                // Re-seed fine DDA at the ray's entry point into this section.
-                // 'dist' / 'face' were set by the coarse step that brought us here.
-                float3 p = camPos + rd * dist;
-                mp = clamp(int3(floor(p)), lo, hi);   // clamp absorbs boundary fp error
-                tM = InitTMax(mp, float3(1,1,1), camPos, st, tD);
+                float3 p = ro + rd * dist;
+                mp = clamp(int3(floor(p)), lo, hi);
+                tM = InitTMax(mp, float3(1,1,1), ro, st, tD);
                 fineValid = true;
             }
 
@@ -649,23 +675,17 @@ void CSMain(uint3 tid : SV_DispatchThreadID)
                     else             { dist=tM.z; tM.z+=tD.z; mp.z+=st.z; face=st.z>0?5:4; }
                 }
 
-                if (dist > maxDist) break;
-                if (any(mp < lo) || any(mp > hi)) break;   // stepped out of this section
+                if (dist > maxT) break;
+                if (any(mp < lo) || any(mp > hi)) break;
             }
-            if (hit || dist > maxDist) break;
+            if (hit || dist > maxT) break;
 
-            // Fine walk has stepped into the neighbouring section; resync the
-            // coarse cursor from the authoritative fine position so the two
-            // grids can never drift apart.
             sc  = SectionOf(mp);
-            tMC = InitTMax(sc, SEC_F, camPos, st, tD);
-            // fineValid stays true: mp/tM already describe the entry voxel of 'sc'.
+            tMC = InitTMax(sc, SEC_F, ro, st, tD);
         }
         else
         {
-            // ---- Empty section: one coarse DDA step skips the whole cell ----
             skipFirst = false;
-
             if (tMC.x < tMC.y) {
                 if (tMC.x < tMC.z) { dist=tMC.x; tMC.x+=tDC.x; sc.x+=st.x; face=st.x>0?1:0; }
                 else               { dist=tMC.z; tMC.z+=tDC.z; sc.z+=st.z; face=st.z>0?5:4; }
@@ -673,14 +693,54 @@ void CSMain(uint3 tid : SV_DispatchThreadID)
                 if (tMC.y < tMC.z) { dist=tMC.y; tMC.y+=tDC.y; sc.y+=st.y; face=st.y>0?3:2; }
                 else               { dist=tMC.z; tMC.z+=tDC.z; sc.z+=st.z; face=st.z>0?5:4; }
             }
-            fineValid = false;   // mp/tM are stale; will be reseeded on next occupied cell.
+            fineValid = false;
         }
     }
+
+    outDist = dist;
+    outFace = face;
+    outVox  = mp;
+    return hit;
+}
+
+[numthreads(8,8,1)]
+void CSMain(uint3 tid : SV_DispatchThreadID)
+{
+    if (tid.x >= screenW || tid.y >= screenH) return;
+
+    float asp = float(screenW) / float(max(1u, screenH));
+    float px  = (2.0*(float(tid.x)+0.5)/float(screenW)-1.0) * asp * tanHalfFov;
+    float py  = (1.0-2.0*(float(tid.y)+0.5)/float(screenH)) * tanHalfFov;
+    float3 rd = normalize(camFwd + camRight*px + camUp*py);
+
+    // ---- Primary ray ----
+    float dist; int face; int3 mp;
+    bool hit = Trace(camPos, rd, maxDist, dist, face, mp);
 
     float4 color;
     if (hit) {
         uint bt = GetBlock(mp);
         float3 c = BlockColor(bt, face, mp) * faceBri[face];
+
+        // ---- World-space ambient occlusion (6 fixed secondary rays) ----
+        float3 N = faceN[face];
+        float3 T = faceT[face];
+        float3 B = faceB[face];
+        float3 hitPos   = camPos + rd * dist;
+        float3 aoOrigin = hitPos + N * AO_BIAS;
+
+        float occ = 0.0;
+        [loop] for (int s = 0; s < AO_SAMPLES; ++s)
+        {
+            float3 h     = AO_DIRS[s];
+            float3 aoDir = T * h.x + B * h.y + N * h.z;
+            float  aoDist; int aoFace; int3 aoVox;
+            if (Trace(aoOrigin, aoDir, AO_MAX_DIST, aoDist, aoFace, aoVox))
+                occ += saturate(1.0 - aoDist / AO_MAX_DIST);
+        }
+        float ao = 1.0 - occ / float(AO_SAMPLES);
+        c *= (1.0 - AO_STRENGTH) + AO_STRENGTH * ao;
+
         float fogT = saturate(dist/maxDist); fogT *= fogT;
         c = lerp(c, FOG_CLR, fogT);
         color = float4(c, 1.0);
