@@ -544,12 +544,13 @@ static const float AO_MAX_DIST = 12.0;
 static const float AO_BIAS     = 0.02;
 static const float AO_STRENGTH = 0.9;
 
+// Directional influence: sun-facing surfaces receive less AO shadowing.
+// Set AO_SUN_INFLUENCE to 0.0 for omnidirectional AO (original behaviour).
+static const float3 AO_SUN_DIR       = float3(0.8305, 0.4983, 0.2491); // morning sun high in east
+static const float  AO_SUN_INFLUENCE = 1.0;   // 0 = omni, 1 = full directional
+static const float  AO_MIN_BRIGHT    = 0.12;  // floor to prevent pure-black backfaces
+
 // 6 fixed hemisphere directions in tangent space (z = along normal).
-// Two interleaved rings: 3 @ 25 deg elevation (horizon / contact shadow)
-//                       + 3 @ 60 deg elevation (upper hemisphere / open sky).
-// Azimuths are offset 15 deg so no component is exactly 0; after the
-// axis-aligned {T,B,N} transform, no world-space AO ray component is 0
-// either, which sidesteps the 0*inf edge case in the DDA for all AO rays.
 static const float3 AO_DIRS[6] = {
     float3( 0.87543,  0.23457, 0.42262),
     float3(-0.64085,  0.64085, 0.42262),
@@ -616,12 +617,6 @@ float3 BlockColor(uint bt, int face, int3 bp)
     return c * (1.0 + v);
 }
 
-// =================================================================
-//  Shared two-level (section/voxel) DDA.
-//  Identical control flow to the previously-inline traversal; only
-//  parameterised on origin / direction / max distance so it can be
-//  reused unchanged for both the primary ray and the AO secondaries.
-// =================================================================
 bool Trace(float3 ro, float3 rd, float maxT,
            out float outDist, out int outFace, out int3 outVox)
 {
@@ -639,7 +634,7 @@ bool Trace(float3 ro, float3 rd, float maxT,
     int   face = -1;
     bool  hit  = false;
     bool  fineValid = true;
-    bool  skipFirst = true;   // never test the origin's own voxel
+    bool  skipFirst = true;
 
     [loop] for (int ci = 0; ci < MAX_COARSE; ++ci)
     {
@@ -713,7 +708,6 @@ void CSMain(uint3 tid : SV_DispatchThreadID)
     float py  = (1.0-2.0*(float(tid.y)+0.5)/float(screenH)) * tanHalfFov;
     float3 rd = normalize(camFwd + camRight*px + camUp*py);
 
-    // ---- Primary ray ----
     float dist; int face; int3 mp;
     bool hit = Trace(camPos, rd, maxDist, dist, face, mp);
 
@@ -739,7 +733,13 @@ void CSMain(uint3 tid : SV_DispatchThreadID)
                 occ += saturate(1.0 - aoDist / AO_MAX_DIST);
         }
         float ao = 1.0 - occ / float(AO_SAMPLES);
-        c *= (1.0 - AO_STRENGTH) + AO_STRENGTH * ao;
+
+        // ---- Directional AO modulation: sun-facing surfaces receive less AO ----
+        float NdotL = dot(N, AO_SUN_DIR);
+        float sunFacing = saturate(0.5 - 0.5 * NdotL);     // 0 = facing sun, 1 = away
+        float dirMod = lerp(1.0, sunFacing, AO_SUN_INFLUENCE);
+        float effStrength = AO_STRENGTH * dirMod;
+        c *= max(AO_MIN_BRIGHT, (1.0 - effStrength) + effStrength * ao);
 
         float fogT = saturate(dist/maxDist); fogT *= fogT;
         c = lerp(c, FOG_CLR, fogT);
