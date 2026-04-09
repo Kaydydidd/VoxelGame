@@ -15,6 +15,12 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <unordered_set>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -38,13 +44,14 @@ static constexpr UINT  CHUNK_STAGING = STAGING_SLICE * CHUNK_Z;    // 1 048 576
 
 static constexpr int   MAX_UPLOADS_PER_FRAME = 8;
 static constexpr UINT  FRAME_STAGING_SIZE = MAX_UPLOADS_PER_FRAME * CHUNK_STAGING;
+static constexpr int   GEN_WORKER_COUNT = 2;   // number of terrain-gen worker threads (adjustable)
+static constexpr int   MAX_CLEARS_PER_FRAME = 32;  // atlas voxel-data clears recorded per frame
 
 // ---- Occupancy-map staging (one 1×SECTIONS_PER_CHUNK×1 column per chunk) ----
 static constexpr UINT  OCC_ROW = 256;                                        // D3D12 row-pitch alignment
 static constexpr UINT  CHUNK_OCC_STAGING = OCC_ROW * SECTIONS_PER_CHUNK;     // 2048 – also 512-aligned for placement
 static constexpr UINT  FRAME_OCC_STAGING_SIZE = MAX_UPLOADS_PER_FRAME * CHUNK_OCC_STAGING;
 
-static constexpr int MAX_GENS_PER_FRAME = 16;
 static constexpr int REGION_CHUNK_SHIFT = 3;     // log2(REGION_CHUNKS)
 
 static int ChunkToRegion(int c) { return c >> REGION_CHUNK_SHIFT; }
@@ -119,9 +126,13 @@ namespace {
         int centerRX = INT_MIN, centerRZ = INT_MIN;
         int64_t slotKeys[LOAD_CHUNKS][LOAD_CHUNKS];
 
-        std::deque<std::pair<int, int>> genQueue;
         std::deque<std::pair<int, int>> uploadQueue;
-        std::deque<std::pair<int, int>> clearQueue;     // atlas slots to zero out
+
+        // Split clear path:
+        //   occClearQueue   – tiny 1×8×1 occupancy columns, drained fully every frame
+        //   atlasClearQueue – 32×128×32 voxel blocks, amortised over several frames
+        std::deque<std::pair<int, int>> occClearQueue;
+        std::deque<std::pair<int, int>> atlasClearQueue;
 
         void init() {
             centerRX = centerRZ = INT_MIN;
@@ -130,7 +141,37 @@ namespace {
         }
     } cm;
 
-} // anon
+    // =================================================================
+    //  Background terrain-generation worker pool
+    // =================================================================
+    struct GenJob {
+        int      cx, cz;
+        uint32_t epoch;                  // pool epoch at enqueue time
+    };
+
+    struct GenResult {
+        int                    cx, cz;
+        uint32_t               epoch;
+        std::unique_ptr<Chunk> chunk;    // fully built, owned by the result
+    };
+
+    struct GenWorkerPool {
+        std::vector<std::thread>    threads;
+
+        std::mutex                  mtx;     // guards `jobs` and `results`
+        std::condition_variable     cv;
+        std::deque<GenJob>          jobs;
+        std::deque<GenResult>       results;
+
+        std::atomic<uint32_t>       epoch{ 0 };
+        std::atomic<bool>           stop{ false };
+
+        // MAIN-THREAD ONLY: chunk keys currently queued or in flight for the
+        // *current* epoch.  Cleared wholesale on every region transition.
+        std::unordered_set<int64_t> pending;
+    } gen;
+
+} // anon namespace
 
 // ===================================================================
 //  GPU state (file-local)
@@ -210,11 +251,12 @@ static float FBM(float x, float y, int oct) {
 }
 
 // ===================================================================
-//  Per-chunk terrain generation (same noise, applied per-column)
+//  Per-chunk terrain generation – PURE.  Builds and returns a Chunk
+//  without touching any shared state so it is safe to call from any
+//  worker thread concurrently.
 // ===================================================================
-static void GenerateChunkTerrain(int cx, int cz) {
-    int64_t key = ChunkKey(cx, cz);
-    auto& chunk = cm.chunks[key];
+static std::unique_ptr<Chunk> BuildChunkTerrain(int cx, int cz) {
+    auto chunk = std::make_unique<Chunk>();
 
     int wx0 = cx * CHUNK_X;
     int wz0 = cz * CHUNK_Z;
@@ -233,7 +275,7 @@ static void GenerateChunkTerrain(int cx, int cz) {
             float ridge = std::fabs(FBM(wx * 0.006f, wz * 0.006f, 5) - 0.5f) * 2.0f;
             int surfH = std::clamp(int(20.0f + e * 170.0f + ridge * 18.0f), 0, CHUNK_Y - 1);
 
-            chunk.surfaceY[lz * CHUNK_X + lx] = uint8_t(surfH);
+            chunk->surfaceY[lz * CHUNK_X + lx] = uint8_t(surfH);
 
             BlockType surfType;
             if (surfH < 58)  surfType = BLOCK_SAND;
@@ -246,12 +288,63 @@ static void GenerateChunkTerrain(int cx, int cz) {
                 if (y < surfH - 4) bt = BLOCK_STONE;
                 else if (y < surfH)     bt = BLOCK_DIRT;
                 else                    bt = surfType;
-                chunk.setBlock(lx, y, lz, bt);
+                chunk->setBlock(lx, y, lz, bt);
             }
             for (int y = surfH + 1; y <= WATER_LEVEL && y < CHUNK_Y; ++y)
-                chunk.setBlock(lx, y, lz, y < 42 ? BLOCK_DEEP_WATER : BLOCK_WATER);
+                chunk->setBlock(lx, y, lz, y < 42 ? BLOCK_DEEP_WATER : BLOCK_WATER);
         }
     }
+    return chunk;
+}
+
+// ===================================================================
+//  Worker loop – runs on every generation thread.
+// ===================================================================
+static void GenWorkerLoop() {
+    for (;;) {
+        GenJob job;
+        {
+            std::unique_lock<std::mutex> lk(gen.mtx);
+            gen.cv.wait(lk, [] { return gen.stop.load() || !gen.jobs.empty(); });
+            if (gen.stop.load()) return;
+            job = gen.jobs.front();
+            gen.jobs.pop_front();
+        }
+
+        // Drop stale jobs before doing expensive noise work.
+        if (job.epoch != gen.epoch.load(std::memory_order_relaxed))
+            continue;
+
+        std::unique_ptr<Chunk> c = BuildChunkTerrain(job.cx, job.cz);
+
+        // Drop the finished chunk if it became stale during generation.
+        if (job.epoch != gen.epoch.load(std::memory_order_relaxed))
+            continue;
+
+        std::lock_guard<std::mutex> lk(gen.mtx);
+        gen.results.push_back({ job.cx, job.cz, job.epoch, std::move(c) });
+    }
+}
+
+static void StartGenWorkers(int n = GEN_WORKER_COUNT) {
+    if (!gen.threads.empty()) return;          // idempotent
+    gen.stop = false;
+    gen.threads.reserve(size_t(n));
+    for (int i = 0; i < n; ++i)
+        gen.threads.emplace_back(GenWorkerLoop);
+}
+
+static void StopGenWorkers() {
+    if (gen.threads.empty()) return;
+    gen.stop = true;
+    gen.cv.notify_all();
+    for (auto& t : gen.threads) t.join();
+    gen.threads.clear();
+
+    std::lock_guard<std::mutex> lk(gen.mtx);
+    gen.jobs.clear();
+    gen.results.clear();
+    gen.pending.clear();
 }
 
 // ===================================================================
@@ -278,55 +371,6 @@ static bool RegionInBounds(int rx, int rz, int cRX, int cRZ) {
         rz >= cRZ - 1 && rz <= cRZ + 1;
 }
 
-static void UpdateLoadedArea(int newRX, int newRZ) {
-    int oldRX = cm.centerRX, oldRZ = cm.centerRZ;
-
-    // ---- Evict regions that left the 3×3 boundary (immediate) ----
-    if (oldRX != INT_MIN) {
-        for (int rx = oldRX - 1; rx <= oldRX + 1; ++rx) {
-            for (int rz = oldRZ - 1; rz <= oldRZ + 1; ++rz) {
-                if (RegionInBounds(rx, rz, newRX, newRZ)) continue;
-
-                int cxMin = rx * REGION_CHUNKS;
-                int czMin = rz * REGION_CHUNKS;
-                for (int cx = cxMin; cx < cxMin + REGION_CHUNKS; ++cx) {
-                    for (int cz = czMin; cz < czMin + REGION_CHUNKS; ++cz) {
-                        int sx = AtlasSlot(cx), sz = AtlasSlot(cz);
-                        int64_t key = ChunkKey(cx, cz);
-                        if (cm.slotKeys[sx][sz] == key)
-                            cm.slotKeys[sx][sz] = INT64_MIN;
-                        cm.chunks.erase(key);
-                    }
-                }
-            }
-        }
-    }
-
-    // ---- Queue generation for missing chunks (deferred) ----
-    for (int rx = newRX - 1; rx <= newRX + 1; ++rx) {
-        for (int rz = newRZ - 1; rz <= newRZ + 1; ++rz) {
-            int cxMin = rx * REGION_CHUNKS;
-            int czMin = rz * REGION_CHUNKS;
-            for (int cx = cxMin; cx < cxMin + REGION_CHUNKS; ++cx) {
-                for (int cz = czMin; cz < czMin + REGION_CHUNKS; ++cz) {
-                    int64_t key = ChunkKey(cx, cz);
-                    if (cm.chunks.find(key) == cm.chunks.end()) {
-                        cm.genQueue.push_back({ cx, cz });
-                    }
-                }
-            }
-        }
-    }
-
-    cm.centerRX = newRX;
-    cm.centerRZ = newRZ;
-}
-
-static void EnqueueUploads(const std::vector<std::pair<int, int>>& list) {
-    for (auto& p : list)
-        cm.uploadQueue.push_back(p);
-}
-
 static void EvictRegion(int rx, int rz) {
     int cxMin = rx * REGION_CHUNKS, czMin = rz * REGION_CHUNKS;
     for (int cx = cxMin; cx < cxMin + REGION_CHUNKS; ++cx)
@@ -335,7 +379,8 @@ static void EvictRegion(int rx, int rz) {
             int sx = AtlasSlot(cx), sz = AtlasSlot(cz);
             if (cm.slotKeys[sx][sz] == key) {
                 cm.slotKeys[sx][sz] = INT64_MIN;
-                cm.clearQueue.push_back({ cx, cz });
+                cm.occClearQueue.push_back({ cx, cz });     // cleared this frame
+                cm.atlasClearQueue.push_back({ cx, cz });   // amortised
             }
             cm.chunks.erase(key);
         }
@@ -344,8 +389,16 @@ static void EvictRegion(int rx, int rz) {
 static void ScheduleRegionTransition(int newRX, int newRZ) {
     int oldRX = cm.centerRX, oldRZ = cm.centerRZ;
 
-    cm.genQueue.clear();
+    // ---- Invalidate ALL outstanding generation work immediately ----
+    {
+        std::lock_guard<std::mutex> lk(gen.mtx);
+        gen.epoch.fetch_add(1, std::memory_order_relaxed);
+        gen.jobs.clear();
+        gen.results.clear();
+    }
+    gen.pending.clear();
 
+    // ---- Evict regions that left the 3×3 window ----
     if (oldRX != INT_MIN) {
         for (int rx = oldRX - 1; rx <= oldRX + 1; ++rx)
             for (int rz = oldRZ - 1; rz <= oldRZ + 1; ++rz)
@@ -355,6 +408,10 @@ static void ScheduleRegionTransition(int newRX, int newRZ) {
 
     cm.centerRX = newRX;
     cm.centerRZ = newRZ;
+
+    // ---- Collect generation jobs for the new window ----
+    std::vector<GenJob> newJobs;
+    const uint32_t e = gen.epoch.load(std::memory_order_relaxed);
 
     for (int rx = newRX - 1; rx <= newRX + 1; ++rx)
         for (int rz = newRZ - 1; rz <= newRZ + 1; ++rz) {
@@ -371,44 +428,63 @@ static void ScheduleRegionTransition(int newRX, int newRZ) {
                         }
                     }
                     else {
-                        cm.genQueue.push_back({ cx, cz });
+                        gen.pending.insert(key);
+                        newJobs.push_back({ cx, cz, e });
                     }
                 }
         }
 
-    // ---- Sort generation queue: nearest chunks first ----
+    // ---- Sort: nearest chunks to the camera first ----
     int pcx = int(std::floor(gApp.camX)) >> 5;
     int pcz = int(std::floor(gApp.camY)) >> 5;
-    std::sort(cm.genQueue.begin(), cm.genQueue.end(),
-        [pcx, pcz](const std::pair<int, int>& a, const std::pair<int, int>& b) {
-            int dxa = a.first - pcx, dza = a.second - pcz;
-            int dxb = b.first - pcx, dzb = b.second - pcz;
+    std::sort(newJobs.begin(), newJobs.end(),
+        [pcx, pcz](const GenJob& a, const GenJob& b) {
+            int dxa = a.cx - pcx, dza = a.cz - pcz;
+            int dxb = b.cx - pcx, dzb = b.cz - pcz;
             return (dxa * dxa + dza * dza) < (dxb * dxb + dzb * dzb);
         });
+
+    // ---- Hand the whole batch to the worker pool in one locked push ----
+    {
+        std::lock_guard<std::mutex> lk(gen.mtx);
+        for (auto& j : newJobs)
+            gen.jobs.push_back(j);
+    }
+    gen.cv.notify_all();
 }
 
-static void ProcessGenQueue() {
-    int done = 0;
-    while (done < MAX_GENS_PER_FRAME && !cm.genQueue.empty()) {
-        auto [cx, cz] = cm.genQueue.front();
-        cm.genQueue.pop_front();
+// ===================================================================
+//  Drain the worker completion queue on the MAIN thread.  This is the
+//  only place that inserts into cm.chunks / slotKeys / uploadQueue, so
+//  all GPU-facing state mutation remains single-threaded.
+// ===================================================================
+static void ProcessGenResults() {
+    std::deque<GenResult> local;
+    {
+        std::lock_guard<std::mutex> lk(gen.mtx);
+        local.swap(gen.results);
+    }
 
-        // Skip if no longer needed (rapid successive transitions)
-        int crx = ChunkToRegion(cx), crz = ChunkToRegion(cz);
+    const uint32_t curEpoch = gen.epoch.load(std::memory_order_relaxed);
+
+    for (auto& r : local) {
+        if (r.epoch != curEpoch)                 // stale – pending already wiped on transition
+            continue;
+
+        int64_t key = ChunkKey(r.cx, r.cz);
+        gen.pending.erase(key);
+
+        int crx = ChunkToRegion(r.cx), crz = ChunkToRegion(r.cz);
         if (!RegionInBounds(crx, crz, cm.centerRX, cm.centerRZ))
-            continue;
-
-        // Skip if already generated (overlap with retained region)
-        int64_t key = ChunkKey(cx, cz);
+            continue;                            // defensive – should not happen for curEpoch
         if (cm.chunks.count(key))
-            continue;
+            continue;                            // already present (duplicate guard)
 
-        GenerateChunkTerrain(cx, cz);
+        cm.chunks.emplace(key, std::move(*r.chunk));
 
-        int sx = AtlasSlot(cx), sz = AtlasSlot(cz);
+        int sx = AtlasSlot(r.cx), sz = AtlasSlot(r.cz);
         cm.slotKeys[sx][sz] = key;
-        cm.uploadQueue.push_back({ cx, cz });
-        ++done;
+        cm.uploadQueue.push_back({ r.cx, r.cz });
     }
 }
 
@@ -417,24 +493,38 @@ static void ProcessGenQueue() {
 // ===================================================================
 void GenerateTerrain() {
     cm.init();
+    StartGenWorkers(GEN_WORKER_COUNT);
+
     int prx = BlockToRegion(int(std::floor(gApp.camX)));
     int prz = BlockToRegion(int(std::floor(gApp.camY)));
-
     cm.centerRX = prx;
     cm.centerRZ = prz;
 
-    // Synchronous: all 576 chunks generated before first frame
+    // Enqueue all 576 chunks to the worker pool.
+    std::vector<GenJob> jobs;
+    const uint32_t e = gen.epoch.load(std::memory_order_relaxed);
     for (int rx = prx - 1; rx <= prx + 1; ++rx)
         for (int rz = prz - 1; rz <= prz + 1; ++rz) {
             int cxMin = rx * REGION_CHUNKS, czMin = rz * REGION_CHUNKS;
             for (int cx = cxMin; cx < cxMin + REGION_CHUNKS; ++cx)
                 for (int cz = czMin; cz < czMin + REGION_CHUNKS; ++cz) {
-                    GenerateChunkTerrain(cx, cz);
-                    int sx = AtlasSlot(cx), sz = AtlasSlot(cz);
-                    cm.slotKeys[sx][sz] = ChunkKey(cx, cz);
-                    cm.uploadQueue.push_back({ cx, cz });
+                    gen.pending.insert(ChunkKey(cx, cz));
+                    jobs.push_back({ cx, cz, e });
                 }
         }
+    {
+        std::lock_guard<std::mutex> lk(gen.mtx);
+        for (auto& j : jobs) gen.jobs.push_back(j);
+    }
+    gen.cv.notify_all();
+
+    // Block until every chunk has been generated AND handed back.
+    // Main thread does no noise work – it only drains the completion queue.
+    while (!gen.pending.empty()) {
+        ProcessGenResults();
+        if (!gen.pending.empty())
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
 
     float sh = float(SurfaceHeightAt(gApp.camX, gApp.camY));
     gApp.camZ = sh + 2.5f;
@@ -1159,8 +1249,8 @@ void Render() {
     if (prx != cm.centerRX || prz != cm.centerRZ)
         ScheduleRegionTransition(prx, prz);
 
-    // ---- Amortised CPU generation (before command list recording) ----
-    ProcessGenQueue();
+    // ---- Consume finished chunks from worker threads (cheap, no noise) ----
+    ProcessGenResults();
 
     auto* alloc = gpu.cmdAlloc[gpu.frameIndex].Get();
     Check(alloc->Reset(), "AR");
@@ -1184,7 +1274,10 @@ void Render() {
         }
     }
 
-    bool hasAtlasWork = !cm.clearQueue.empty() || !batch.empty();
+    bool hasAtlasWork = !cm.occClearQueue.empty()
+        || !cm.atlasClearQueue.empty()
+        || !batch.empty();
+
     if (hasAtlasWork) {
         D3D12_RESOURCE_BARRIER bPre[2] = {
             Transition(gpu.atlas.Get(),
@@ -1196,17 +1289,36 @@ void Render() {
         };
         gpu.cmdList->ResourceBarrier(2, bPre);
 
-        // Clears first: zero out evicted slots in BOTH atlas and occupancy.
-        while (!cm.clearQueue.empty()) {
-            auto [cx, cz] = cm.clearQueue.front();
-            cm.clearQueue.pop_front();
-            RecordChunkCopy(gpu.cmdList.Get(), gpu.zeroStaging.Get(), 0,
-                gpu.atlas.Get(), cx, cz);
+        // --- Occupancy clears: ALL of them this frame.
+        //     Each is a 1×8×1 copy (8 effective bytes); zeroing occupancy
+        //     immediately makes the stale atlas voxels unreachable by the
+        //     ray marcher, so no stale geometry is ever drawn.
+        while (!cm.occClearQueue.empty()) {
+            auto [cx, cz] = cm.occClearQueue.front();
+            cm.occClearQueue.pop_front();
+            int sx = AtlasSlot(cx), sz = AtlasSlot(cz);
+            if (cm.slotKeys[sx][sz] != INT64_MIN) continue;      // slot already re-claimed
             RecordOccCopy(gpu.cmdList.Get(), gpu.zeroOccStaging.Get(), 0,
                 gpu.occupancy.Get(), cx, cz);
         }
 
-        // Then uploads: new chunk data + its occupancy column.
+        // --- Atlas voxel clears: amortised across frames.
+        //     Skip any slot that has since been re-claimed so we never
+        //     clobber freshly uploaded data.
+        {
+            int cleared = 0;
+            while (cleared < MAX_CLEARS_PER_FRAME && !cm.atlasClearQueue.empty()) {
+                auto [cx, cz] = cm.atlasClearQueue.front();
+                cm.atlasClearQueue.pop_front();
+                int sx = AtlasSlot(cx), sz = AtlasSlot(cz);
+                if (cm.slotKeys[sx][sz] != INT64_MIN) continue;  // stale request – discard
+                RecordChunkCopy(gpu.cmdList.Get(), gpu.zeroStaging.Get(), 0,
+                    gpu.atlas.Get(), cx, cz);
+                ++cleared;
+            }
+        }
+
+        // --- Uploads: new chunk data + its occupancy column ---
         for (size_t i = 0; i < batch.size(); ++i) {
             RecordChunkCopy(gpu.cmdList.Get(),
                 gpu.frameStaging[gpu.frameIndex].Get(),
@@ -1288,23 +1400,24 @@ void Render() {
 // ===================================================================
 //  Shutdown
 // ===================================================================
-void ShutdownD3D12() {
-    if (!gpu.device) return;
-    WaitForGpu();
-    for (UINT i = 0; i < FRAME_COUNT; ++i) {
-        if (gpu.frameStagingMapped[i]) {
-            gpu.frameStaging[i]->Unmap(0, nullptr);
-            gpu.frameStagingMapped[i] = nullptr;
+    void ShutdownD3D12() {
+        StopGenWorkers();                 // join workers first – safe even if never started
+        if (!gpu.device) return;
+        WaitForGpu();
+        for (UINT i = 0; i < FRAME_COUNT; ++i) {
+            if (gpu.frameStagingMapped[i]) {
+                gpu.frameStaging[i]->Unmap(0, nullptr);
+                gpu.frameStagingMapped[i] = nullptr;
+            }
+            if (gpu.frameOccStagingMapped[i]) {
+                gpu.frameOccStaging[i]->Unmap(0, nullptr);
+                gpu.frameOccStagingMapped[i] = nullptr;
+            }
         }
-        if (gpu.frameOccStagingMapped[i]) {
-            gpu.frameOccStaging[i]->Unmap(0, nullptr);
-            gpu.frameOccStagingMapped[i] = nullptr;
-        }
+        if (gpu.cbMapped) { gpu.cbUpload->Unmap(0, nullptr); gpu.cbMapped = nullptr; }
+        if (gpu.fenceEvent) { CloseHandle(gpu.fenceEvent);     gpu.fenceEvent = nullptr; }
+        cm.chunks.clear();
     }
-    if (gpu.cbMapped) { gpu.cbUpload->Unmap(0, nullptr); gpu.cbMapped = nullptr; }
-    if (gpu.fenceEvent) { CloseHandle(gpu.fenceEvent); gpu.fenceEvent = nullptr; }
-    cm.chunks.clear();
-}
 
 // ===================================================================
 //  Camera / input
