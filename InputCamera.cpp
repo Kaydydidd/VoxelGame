@@ -1,5 +1,5 @@
 #include "voxel.h"
-#include "VoxelInternal.h"
+#include "ChunkStreaming.h"
 
 #include <algorithm>
 #include <cmath>
@@ -58,7 +58,7 @@ void UpdateCamera(float dt) {
         if (KeyDown(VK_CONTROL) || KeyDown('F')) gApp.camZ -= liftSpeed * dt;
     }
     else {
-        float sh = float(GetSurfaceHeight(gApp.camX, gApp.camY));
+        float sh = float(SurfaceHeightAt(gApp.camX, gApp.camY));
         float target = sh + 1.0f + 1.5f;
         float follow = std::clamp(dt * 8.0f, 0.0f, 1.0f);
         gApp.camZ = Lerp(gApp.camZ, target, follow);

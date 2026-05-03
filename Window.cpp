@@ -1,5 +1,5 @@
 #include "voxel.h"
-#include "VoxelInternal.h"
+#include "ChunkStreaming.h"
 
 #include <cstdio>
 
@@ -7,8 +7,8 @@ void UpdateWindowTitle(HWND hwnd, float dt) {
     gApp.fpsTimer += dt; gApp.fpsFrames++;
     if (gApp.fpsTimer >= 0.5f) {
         float fps = float(gApp.fpsFrames) / gApp.fpsTimer;
-        int loaded = int(GetLoadedChunkCount());
-        int queued = int(GetUploadQueueCount());
+        int loaded = int(LoadedChunkCount());
+        int queued = int(UploadQueueCount());
         wchar_t buf[256];
         swprintf_s(buf, L"Voxel Terrain | chunks:%d queue:%d | FPS:%d", loaded, queued, int(fps));
         SetWindowTextW(hwnd, buf);

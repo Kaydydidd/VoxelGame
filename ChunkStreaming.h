@@ -31,3 +31,8 @@ struct ChunkMgr {
 };
 
 extern ChunkMgr cm;
+
+uint8_t SurfaceHeightAt(float wx, float wz);
+
+int LoadedChunkCount();
+int UploadQueueCount();

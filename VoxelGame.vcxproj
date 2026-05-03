@@ -135,7 +135,6 @@
     <ClCompile Include="InputCamera.cpp" />
     <ClCompile Include="TerrainGen.cpp" />
     <ClCompile Include="TerrainNoise.cpp" />
-    <ClCompile Include="VoxelInternal.h" />
     <ClCompile Include="voxel.cpp" />
     <ClCompile Include="VoxelShader.cpp" />
     <ClCompile Include="VoxelStaging.cpp" />

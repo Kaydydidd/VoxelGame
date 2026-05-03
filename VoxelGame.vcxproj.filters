@@ -52,9 +52,6 @@
     <ClCompile Include="TerrainNoise.cpp">
       <Filter>Src\World\Noise</Filter>
     </ClCompile>
-    <ClCompile Include="VoxelInternal.h">
-      <Filter>Src\Main</Filter>
-    </ClCompile>
     <ClCompile Include="TerrainGen.cpp">
       <Filter>Src\World\Chunking</Filter>
     </ClCompile>

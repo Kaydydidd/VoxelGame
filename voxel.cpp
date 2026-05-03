@@ -190,18 +190,6 @@ static void StopGenWorkers() {
 }
 
 // ===================================================================
-//  Surface height query (for camera ground-follow)
-// ===================================================================
-static uint8_t SurfaceHeightAt(float wx, float wz) {
-    int bx = int(std::floor(wx)), bz = int(std::floor(wz));
-    int cx = bx >> 5, cz = bz >> 5;
-    int lx = bx & 31, lz = bz & 31;
-    auto it = cm.chunks.find(ChunkKey(cx, cz));
-    if (it == cm.chunks.end()) return 0;
-    return it->second.surfaceY[lz * CHUNK_X + lx];
-}
-
-// ===================================================================
 //  Chunk streaming – determine which chunks to load/unload
 // ===================================================================
 static void EvictRegion(int rx, int rz) {
@@ -848,19 +836,4 @@ void Render() {
         if (gpu.cbMapped) { gpu.cbUpload->Unmap(0, nullptr); gpu.cbMapped = nullptr; }
         if (gpu.fenceEvent) { CloseHandle(gpu.fenceEvent);     gpu.fenceEvent = nullptr; }
         cm.chunks.clear();
-    }
-
- // ===================================================================
- //  Camera and Window helpers
- // ===================================================================
-    float GetSurfaceHeight(float wx, float wz) {
-        return float(SurfaceHeightAt(wx, wz));
-    }
-
-    int GetLoadedChunkCount() {
-        return int(cm.chunks.size());
-    }
-
-    int GetUploadQueueCount() {
-        return int(cm.uploadQueue.size());
     }
