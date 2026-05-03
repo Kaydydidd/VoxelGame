@@ -134,12 +134,14 @@
     <ClCompile Include="VoxelInternal.h" />
     <ClCompile Include="voxel.cpp" />
     <ClCompile Include="VoxelShader.cpp" />
+    <ClCompile Include="VoxelWorld.cpp" />
     <ClCompile Include="Window.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="TerrainNoise.h" />
     <ClInclude Include="voxel.h" />
     <ClInclude Include="VoxelShader.h" />
+    <ClInclude Include="VoxelWorld.h" />
   </ItemGroup>
   <ItemGroup>
     <Text Include="ReadMe.txt" />

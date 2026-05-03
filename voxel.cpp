@@ -1,6 +1,8 @@
 #include "voxel.h"
+#include "VoxelInternal.h"
 #include "VoxelShader.h"
 #include "TerrainNoise.h"
+#include "VoxelWorld.h"
 
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -52,10 +54,6 @@ static constexpr UINT  OCC_ROW = 256;                                        // 
 static constexpr UINT  CHUNK_OCC_STAGING = OCC_ROW * SECTIONS_PER_CHUNK;     // 2048 – also 512-aligned for placement
 static constexpr UINT  FRAME_OCC_STAGING_SIZE = MAX_UPLOADS_PER_FRAME * CHUNK_OCC_STAGING;
 
-static constexpr int REGION_CHUNK_SHIFT = 3;     // log2(REGION_CHUNKS)
-
-static int ChunkToRegion(int c) { return c >> REGION_CHUNK_SHIFT; }
-
 // ===================================================================
 //  Frame constants (HLSL mirror)
 // ===================================================================
@@ -75,50 +73,6 @@ static_assert(sizeof(FrameConstants) <= CB_ALIGN);
 //  Chunk data structures (file-local)
 // ===================================================================
 namespace {
-
-    struct ChunkSection {
-        uint8_t  blocks[CHUNK_X * SECTION_Y * CHUNK_Z]{};
-        uint16_t solidCount = 0;
-    };
-
-    struct Chunk {
-        std::unique_ptr<ChunkSection> sections[SECTIONS_PER_CHUNK];
-        uint8_t surfaceY[CHUNK_X * CHUNK_Z]{};
-
-        uint8_t getBlock(int lx, int ly, int lz) const {
-            if (ly < 0 || ly >= CHUNK_Y) return BLOCK_AIR;
-            int si = ly >> 4;
-            if (!sections[si]) return BLOCK_AIR;
-            return sections[si]->blocks[lx + (ly & 15) * CHUNK_X
-                + lz * SECTION_Y * CHUNK_X];
-        }
-
-        void setBlock(int lx, int ly, int lz, uint8_t bt) {
-            if (ly < 0 || ly >= CHUNK_Y) return;
-            int si = ly >> 4;
-            int idx = lx + (ly & 15) * CHUNK_X + lz * SECTION_Y * CHUNK_X;
-
-            if (!sections[si]) {
-                if (bt == BLOCK_AIR) return;
-                sections[si] = std::make_unique<ChunkSection>();
-            }
-            auto& s = *sections[si];
-            uint8_t old = s.blocks[idx];
-            if (old == bt) return;
-            if (old == BLOCK_AIR) ++s.solidCount;
-            if (bt == BLOCK_AIR) --s.solidCount;
-            s.blocks[idx] = bt;
-            if (s.solidCount == 0) sections[si].reset();
-        }
-    };
-
-    // ---- chunk key helpers ----
-    inline int64_t ChunkKey(int cx, int cz) {
-        return (int64_t(cx) << 32) | (int64_t(cz) & 0xFFFFFFFF);
-    }
-    inline int AtlasSlot(int c) {
-        return ((c % LOAD_CHUNKS) + LOAD_CHUNKS) % LOAD_CHUNKS;
-    }
 
     // ---- chunk manager state ----
     struct ChunkMgr {

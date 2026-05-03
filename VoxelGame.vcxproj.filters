@@ -1,69 +1,67 @@
 ﻿<?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
-    <Filter Include="Source Files">
+    <Filter Include="Src">
       <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
       <Extensions>cpp;c;cc;cxx;c++;cppm;ixx;def;odl;idl;hpj;bat;asm;asmx</Extensions>
     </Filter>
-    <Filter Include="Header Files">
-      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
-      <Extensions>h;hh;hpp;hxx;h++;hm;inl;inc;ipp;xsd</Extensions>
-    </Filter>
-    <Filter Include="Resource Files">
-      <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
-      <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
-    </Filter>
-    <Filter Include="Source Files\Shaders">
+    <Filter Include="Src\Shaders">
       <UniqueIdentifier>{993b294c-55bb-4910-9410-8a6150c3a084}</UniqueIdentifier>
     </Filter>
-    <Filter Include="Source Files\Camera and Window">
+    <Filter Include="Src\Camera and Window">
       <UniqueIdentifier>{4ffec030-a731-4a66-9d24-87d096834799}</UniqueIdentifier>
     </Filter>
-    <Filter Include="Source Files\Main">
+    <Filter Include="Src\Main">
       <UniqueIdentifier>{d23f7bfb-12f5-45bf-8ed6-1d7eb059f5e3}</UniqueIdentifier>
     </Filter>
-    <Filter Include="Source Files\World">
+    <Filter Include="Src\World">
       <UniqueIdentifier>{073f7b5e-4bde-4ceb-8b9f-02f86db1f1bc}</UniqueIdentifier>
     </Filter>
-    <Filter Include="Source Files\World\Noise">
+    <Filter Include="Src\World\Noise">
       <UniqueIdentifier>{c5fc1383-ad49-4d0b-9827-991d80d66029}</UniqueIdentifier>
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="VoxelInternal.h">
-      <Filter>Header Files</Filter>
-    </ClCompile>
     <ClCompile Include="VoxelShader.cpp">
-      <Filter>Source Files\Shaders</Filter>
+      <Filter>Src\Shaders</Filter>
     </ClCompile>
     <ClCompile Include="InputCamera.cpp">
-      <Filter>Source Files\Camera and Window</Filter>
+      <Filter>Src\Camera and Window</Filter>
     </ClCompile>
     <ClCompile Include="Window.cpp">
-      <Filter>Source Files\Camera and Window</Filter>
+      <Filter>Src\Camera and Window</Filter>
     </ClCompile>
     <ClCompile Include="AppState.cpp">
-      <Filter>Source Files\Main</Filter>
+      <Filter>Src\Main</Filter>
     </ClCompile>
     <ClCompile Include="voxel.cpp">
-      <Filter>Source Files\Main</Filter>
+      <Filter>Src\Main</Filter>
     </ClCompile>
     <ClCompile Include="Demo.cpp">
-      <Filter>Source Files\Main</Filter>
+      <Filter>Src\Main</Filter>
     </ClCompile>
     <ClCompile Include="TerrainNoise.cpp">
-      <Filter>Source Files\World\Noise</Filter>
+      <Filter>Src\World\Noise</Filter>
+    </ClCompile>
+    <ClCompile Include="VoxelInternal.h">
+      <Filter>Src\Main</Filter>
+    </ClCompile>
+    <ClCompile Include="VoxelWorld.cpp">
+      <Filter>Src\World</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="VoxelShader.h">
-      <Filter>Header Files</Filter>
+      <Filter>Src\Shaders</Filter>
     </ClInclude>
     <ClInclude Include="voxel.h">
-      <Filter>Header Files</Filter>
+      <Filter>Src\Main</Filter>
     </ClInclude>
     <ClInclude Include="TerrainNoise.h">
-      <Filter>Header Files</Filter>
+      <Filter>Src\World\Noise</Filter>
+    </ClInclude>
+    <ClInclude Include="VoxelWorld.h">
+      <Filter>Src\World</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
