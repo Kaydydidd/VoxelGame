@@ -73,6 +73,9 @@
     <ClCompile Include="D3D12ResourceUtils.cpp">
       <Filter>Src\Rendering\D3D12</Filter>
     </ClCompile>
+    <ClCompile Include="VoxelUploadCopies.cpp">
+      <Filter>Src\Rendering\D3D12</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="VoxelShader.h">
@@ -92,6 +95,9 @@
     </ClInclude>
     <ClInclude Include="VoxelStaging.h">
       <Filter>Src\World\Chunking</Filter>
+    </ClInclude>
+    <ClInclude Include="VoxelUploadCopies.h">
+      <Filter>Src\Rendering\D3D12</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
