@@ -127,11 +127,19 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="AppState.cpp" />
     <ClCompile Include="Demo.cpp" />
+    <ClCompile Include="InputCamera.cpp" />
+    <ClCompile Include="TerrainNoise.cpp" />
+    <ClCompile Include="VoxelInternal.h" />
     <ClCompile Include="voxel.cpp" />
+    <ClCompile Include="VoxelShader.cpp" />
+    <ClCompile Include="Window.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="TerrainNoise.h" />
     <ClInclude Include="voxel.h" />
+    <ClInclude Include="VoxelShader.h" />
   </ItemGroup>
   <ItemGroup>
     <Text Include="ReadMe.txt" />
