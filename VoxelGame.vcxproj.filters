@@ -26,6 +26,12 @@
     <Filter Include="Src\World\Chunking">
       <UniqueIdentifier>{b1776911-98b5-4e26-8998-83f1a3fc8e4d}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Src\Rendering">
+      <UniqueIdentifier>{47f3c74c-d9cf-4815-bad0-1d217340a6c5}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Src\Rendering\D3D12">
+      <UniqueIdentifier>{2469917a-d344-4fc0-b016-b3046e5ef1aa}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="VoxelShader.cpp">
@@ -60,6 +66,12 @@
     </ClCompile>
     <ClCompile Include="VoxelStaging.cpp">
       <Filter>Src\World\Chunking</Filter>
+    </ClCompile>
+    <ClCompile Include="D3D12ResourceUtils.h">
+      <Filter>Src\Rendering\D3D12</Filter>
+    </ClCompile>
+    <ClCompile Include="D3D12ResourceUtils.cpp">
+      <Filter>Src\Rendering\D3D12</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>

@@ -5,6 +5,7 @@
 #include "VoxelWorld.h"
 #include "TerrainGen.h"
 #include "VoxelStaging.h"
+#include "D3D12ResourceUtils.h"
 
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -156,13 +157,6 @@ static struct GpuState {
     ComPtr<ID3D12Resource> frameOccStaging[FRAME_COUNT];
     uint8_t* frameOccStagingMapped[FRAME_COUNT]{};
 } gpu;
-
-// ===================================================================
-//  Error helper
-// ===================================================================
-static void Check(HRESULT hr, const char* m) {
-    if (FAILED(hr)) { OutputDebugStringA(m); throw std::runtime_error(m); }
-}
 
 // ===================================================================
 //  Worker loop – runs on every generation thread.
@@ -400,17 +394,6 @@ void GenerateTerrain() {
 // ===================================================================
 //  D3D12 utilities
 // ===================================================================
-static D3D12_RESOURCE_BARRIER Transition(ID3D12Resource* r,
-    D3D12_RESOURCE_STATES bef, D3D12_RESOURCE_STATES aft) {
-    D3D12_RESOURCE_BARRIER b{};
-    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    b.Transition.pResource = r;
-    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    b.Transition.StateBefore = bef;
-    b.Transition.StateAfter = aft;
-    return b;
-}
-
 static void WaitForGpu() {
     Check(gpu.queue->Signal(gpu.fence.Get(), gpu.fenceValues[gpu.frameIndex]), "Sig");
     if (gpu.fence->GetCompletedValue() < gpu.fenceValues[gpu.frameIndex]) {
@@ -431,48 +414,6 @@ static void MoveToNextFrame() {
         WaitForSingleObject(gpu.fenceEvent, INFINITE);
     }
     gpu.fenceValues[gpu.frameIndex] = sub + 1;
-}
-
-static ComPtr<ID3D12Resource> CreateUploadBuffer(UINT64 sz) {
-    D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_UPLOAD;
-    D3D12_RESOURCE_DESC rd{};
-    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    rd.Width = sz; rd.Height = 1; rd.DepthOrArraySize = 1;
-    rd.MipLevels = 1; rd.SampleDesc.Count = 1;
-    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    ComPtr<ID3D12Resource> r;
-    Check(gpu.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&r)),
-        "UploadBuf");
-    return r;
-}
-
-static ComPtr<ID3D12Resource> CreateDefaultTex2D(DXGI_FORMAT fmt, UINT w, UINT h,
-    D3D12_RESOURCE_FLAGS fl, D3D12_RESOURCE_STATES st) {
-    D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-    D3D12_RESOURCE_DESC rd{};
-    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    rd.Width = w; rd.Height = h; rd.DepthOrArraySize = 1;
-    rd.MipLevels = 1; rd.Format = fmt; rd.SampleDesc.Count = 1; rd.Flags = fl;
-    ComPtr<ID3D12Resource> r;
-    Check(gpu.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-        st, nullptr, IID_PPV_ARGS(&r)), "Tex2D");
-    return r;
-}
-
-static ComPtr<ID3D12Resource> CreateDefaultTex3D(DXGI_FORMAT fmt,
-    UINT w, UINT h, UINT d,
-    D3D12_RESOURCE_FLAGS fl, D3D12_RESOURCE_STATES st) {
-    D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-    D3D12_RESOURCE_DESC rd{};
-    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-    rd.Width = w; rd.Height = h;
-    rd.DepthOrArraySize = UINT16(d);
-    rd.MipLevels = 1; rd.Format = fmt; rd.SampleDesc.Count = 1; rd.Flags = fl;
-    ComPtr<ID3D12Resource> r;
-    Check(gpu.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-        st, nullptr, IID_PPV_ARGS(&r)), "Tex3D");
-    return r;
 }
 
 // Record a CopyTextureRegion for one chunk from staging into the atlas.
@@ -532,10 +473,14 @@ static void RecordOccCopy(ID3D12GraphicsCommandList* cl,
 //  Size-dependent resources
 // ===================================================================
 static void CreateSizeDependentResources() {
-    gpu.outputTex = CreateDefaultTex2D(DXGI_FORMAT_R8G8B8A8_UNORM,
-        gApp.width, gApp.height,
+    gpu.outputTex = CreateDefaultTex2D(
+        gpu.device.Get(),
+        DXGI_FORMAT_R8G8B8A8_UNORM,
+        gApp.width,
+        gApp.height,
         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+    );
 
     // Heap layout: [0]=atlas SRV, [1]=occupancy SRV, [2]=output UAV
     D3D12_CPU_DESCRIPTOR_HANDLE h = gpu.srvHeap->GetCPUDescriptorHandleForHeapStart();
@@ -694,28 +639,40 @@ void InitD3D12(HWND hwnd) {
     Check(gpu.device->CreateComputePipelineState(&psd, IID_PPV_ARGS(&gpu.pso)), "PSO");
 
     // ---- CB ring ----
-    gpu.cbUpload = CreateUploadBuffer(FRAME_COUNT * CB_ALIGN);
+    gpu.cbUpload = CreateUploadBuffer(gpu.device.Get(), FRAME_COUNT * CB_ALIGN);
     Check(gpu.cbUpload->Map(0, nullptr, reinterpret_cast<void**>(&gpu.cbMapped)), "MCB");
 
     // ---- Per-frame staging buffers (voxel + occupancy) ----
     for (UINT i = 0; i < FRAME_COUNT; ++i) {
-        gpu.frameStaging[i] = CreateUploadBuffer(FRAME_STAGING_SIZE);
+        gpu.frameStaging[i] = CreateUploadBuffer(gpu.device.Get(), FRAME_STAGING_SIZE);
         Check(gpu.frameStaging[i]->Map(0, nullptr,
             reinterpret_cast<void**>(&gpu.frameStagingMapped[i])), "MS");
 
-        gpu.frameOccStaging[i] = CreateUploadBuffer(FRAME_OCC_STAGING_SIZE);
+        gpu.frameOccStaging[i] = CreateUploadBuffer(gpu.device.Get(), FRAME_OCC_STAGING_SIZE);
         Check(gpu.frameOccStaging[i]->Map(0, nullptr,
             reinterpret_cast<void**>(&gpu.frameOccStagingMapped[i])), "MOS");
     }
 
     // ---- Atlas + Occupancy (COPY_DEST initially for bulk upload) ----
-    gpu.atlas = CreateDefaultTex3D(DXGI_FORMAT_R8_UINT,
-        ATLAS_XZ, CHUNK_Y, ATLAS_XZ,
-        D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    gpu.atlas = CreateDefaultTex3D(
+        gpu.device.Get(),
+        DXGI_FORMAT_R8_UINT,
+        ATLAS_XZ,
+        CHUNK_Y,
+        ATLAS_XZ,
+        D3D12_RESOURCE_FLAG_NONE,
+        D3D12_RESOURCE_STATE_COPY_DEST
+    );
 
-    gpu.occupancy = CreateDefaultTex3D(DXGI_FORMAT_R8_UINT,
-        LOAD_CHUNKS, SECTIONS_PER_CHUNK, LOAD_CHUNKS,
-        D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    gpu.occupancy = CreateDefaultTex3D(
+        gpu.device.Get(),
+        DXGI_FORMAT_R8_UINT,
+        LOAD_CHUNKS,
+        SECTIONS_PER_CHUNK,
+        LOAD_CHUNKS,
+        D3D12_RESOURCE_FLAG_NONE,
+        D3D12_RESOURCE_STATE_COPY_DEST
+    );
 
     // ---- Bulk upload all queued chunks (voxels + occupancy) ----
     {
@@ -774,7 +731,7 @@ void InitD3D12(HWND hwnd) {
     }
 
     // ---- Zero staging for atlas clears (one chunk, zeroed once) ----
-    gpu.zeroStaging = CreateUploadBuffer(CHUNK_STAGING);
+    gpu.zeroStaging = CreateUploadBuffer(gpu.device.Get(), CHUNK_STAGING);
     {
         uint8_t* zp = nullptr;
         Check(gpu.zeroStaging->Map(0, nullptr, reinterpret_cast<void**>(&zp)), "MZ");
@@ -783,7 +740,7 @@ void InitD3D12(HWND hwnd) {
     }
 
     // ---- Zero staging for occupancy clears (one column, zeroed once) ----
-    gpu.zeroOccStaging = CreateUploadBuffer(CHUNK_OCC_STAGING);
+    gpu.zeroOccStaging = CreateUploadBuffer(gpu.device.Get(), CHUNK_OCC_STAGING);
     {
         uint8_t* zp = nullptr;
         Check(gpu.zeroOccStaging->Map(0, nullptr, reinterpret_cast<void**>(&zp)), "MZO");
