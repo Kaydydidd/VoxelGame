@@ -20,6 +20,9 @@
     <Filter Include="Src\World\Noise">
       <UniqueIdentifier>{c5fc1383-ad49-4d0b-9827-991d80d66029}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Src\World\Terrain">
+      <UniqueIdentifier>{f5847692-8320-4b15-8a29-45e4268c04e6}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="VoxelShader.cpp">
@@ -49,6 +52,9 @@
     <ClCompile Include="VoxelWorld.cpp">
       <Filter>Src\World</Filter>
     </ClCompile>
+    <ClCompile Include="TerrainGen.cpp">
+      <Filter>Src\World\Terrain</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="VoxelShader.h">
@@ -62,6 +68,9 @@
     </ClInclude>
     <ClInclude Include="VoxelWorld.h">
       <Filter>Src\World</Filter>
+    </ClInclude>
+    <ClInclude Include="TerrainGen.h">
+      <Filter>Src\World\Terrain</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
