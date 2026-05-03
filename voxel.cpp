@@ -4,6 +4,7 @@
 #include "TerrainNoise.h"
 #include "VoxelWorld.h"
 #include "TerrainGen.h"
+#include "VoxelStaging.h"
 
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -39,19 +40,12 @@ using Microsoft::WRL::ComPtr;
 static constexpr UINT  FRAME_COUNT = 2;
 static constexpr UINT  CB_ALIGN = 256;
 
-// Staging: 256-byte aligned row pitch for chunk width
-static constexpr UINT  STAGING_ROW = (CHUNK_X + 255u) & ~255u;  // 256
-static constexpr UINT  STAGING_SLICE = STAGING_ROW * CHUNK_Y;      // 32768
-static constexpr UINT  CHUNK_STAGING = STAGING_SLICE * CHUNK_Z;    // 1 048 576
-
 static constexpr int   MAX_UPLOADS_PER_FRAME = 8;
 static constexpr UINT  FRAME_STAGING_SIZE = MAX_UPLOADS_PER_FRAME * CHUNK_STAGING;
 static constexpr int   GEN_WORKER_COUNT = 2;   // number of terrain-gen worker threads (adjustable)
 static constexpr int   MAX_CLEARS_PER_FRAME = 32;  // atlas voxel-data clears recorded per frame
 
 // ---- Occupancy-map staging (one 1×SECTIONS_PER_CHUNK×1 column per chunk) ----
-static constexpr UINT  OCC_ROW = 256;                                        // D3D12 row-pitch alignment
-static constexpr UINT  CHUNK_OCC_STAGING = OCC_ROW * SECTIONS_PER_CHUNK;     // 2048 – also 512-aligned for placement
 static constexpr UINT  FRAME_OCC_STAGING_SIZE = MAX_UPLOADS_PER_FRAME * CHUNK_OCC_STAGING;
 
 // ===================================================================
@@ -401,37 +395,6 @@ void GenerateTerrain() {
 
     float sh = float(SurfaceHeightAt(gApp.camX, gApp.camY));
     gApp.camZ = sh + 2.5f;
-}
-
-// ===================================================================
-//  Flatten sparse chunk into staging-buffer layout
-// ===================================================================
-static void FlattenChunk(const Chunk& c, uint8_t* dst) {
-    std::memset(dst, BLOCK_AIR, CHUNK_STAGING);
-    for (int si = 0; si < SECTIONS_PER_CHUNK; ++si) {
-        if (!c.sections[si]) continue;
-        const auto& sec = *c.sections[si];
-        for (int lz = 0; lz < CHUNK_Z; ++lz)
-            for (int lyl = 0; lyl < SECTION_Y; ++lyl) {
-                int wy = si * SECTION_Y + lyl;
-                std::memcpy(
-                    dst + size_t(lz) * STAGING_SLICE
-                    + size_t(wy) * STAGING_ROW,
-                    &sec.blocks[lyl * CHUNK_X + lz * SECTION_Y * CHUNK_X],
-                    CHUNK_X);
-            }
-    }
-}
-
-// ===================================================================
-//  Flatten chunk section-occupancy into staging-buffer layout.
-//  Footprint is 1 × SECTIONS_PER_CHUNK × 1 with RowPitch = OCC_ROW, so
-//  section si lives at byte offset si * OCC_ROW.
-// ===================================================================
-static void FlattenOccupancy(const Chunk& c, uint8_t* dst) {
-    std::memset(dst, 0, CHUNK_OCC_STAGING);
-    for (int si = 0; si < SECTIONS_PER_CHUNK; ++si)
-        dst[size_t(si) * OCC_ROW] = c.sections[si] ? 1u : 0u;
 }
 
 // ===================================================================

@@ -23,6 +23,9 @@
     <Filter Include="Src\World\Terrain">
       <UniqueIdentifier>{f5847692-8320-4b15-8a29-45e4268c04e6}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Src\World\Chunking">
+      <UniqueIdentifier>{b1776911-98b5-4e26-8998-83f1a3fc8e4d}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="VoxelShader.cpp">
@@ -53,7 +56,10 @@
       <Filter>Src\World</Filter>
     </ClCompile>
     <ClCompile Include="TerrainGen.cpp">
-      <Filter>Src\World\Terrain</Filter>
+      <Filter>Src\World\Chunking</Filter>
+    </ClCompile>
+    <ClCompile Include="VoxelStaging.cpp">
+      <Filter>Src\World\Chunking</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
@@ -70,7 +76,10 @@
       <Filter>Src\World</Filter>
     </ClInclude>
     <ClInclude Include="TerrainGen.h">
-      <Filter>Src\World\Terrain</Filter>
+      <Filter>Src\World\Chunking</Filter>
+    </ClInclude>
+    <ClInclude Include="VoxelStaging.h">
+      <Filter>Src\World\Chunking</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
