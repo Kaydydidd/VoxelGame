@@ -21,3 +21,11 @@ struct Chunk {
 int64_t ChunkKey(int cx, int cz);
 int AtlasSlot(int c);
 int ChunkToRegion(int c);
+int BlockToRegion(int b);
+
+bool RegionInBounds(
+    int rx,
+    int rz,
+    int centerRX,
+    int centerRZ
+);

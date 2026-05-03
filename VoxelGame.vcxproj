@@ -128,6 +128,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="AppState.cpp" />
+    <ClCompile Include="ChunkStreaming.cpp" />
     <ClCompile Include="D3D12ResourceUtils.cpp" />
     <ClCompile Include="D3D12ResourceUtils.h" />
     <ClCompile Include="Demo.cpp" />
@@ -143,6 +144,7 @@
     <ClCompile Include="Window.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="ChunkStreaming.h" />
     <ClInclude Include="TerrainGen.h" />
     <ClInclude Include="TerrainNoise.h" />
     <ClInclude Include="voxel.h" />

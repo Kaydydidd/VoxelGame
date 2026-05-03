@@ -56,3 +56,24 @@ int AtlasSlot(int c) {
 int ChunkToRegion(int c) {
     return c >> 3;
 }
+
+// ===================================================================
+//  Chunk streaming – determine which chunks to load/unload
+// ===================================================================
+namespace {
+    constexpr int REGION_BLOCK_SHIFT = 8; // log2(REGION_CHUNKS * CHUNK_X) = log2(256)
+}
+
+int BlockToRegion(int b) {
+    return b >> REGION_BLOCK_SHIFT;
+}
+
+bool RegionInBounds(
+    int rx,
+    int rz,
+    int centerRX,
+    int centerRZ
+) {
+    return rx >= centerRX - 1 && rx <= centerRX + 1 &&
+        rz >= centerRZ - 1 && rz <= centerRZ + 1;
+}

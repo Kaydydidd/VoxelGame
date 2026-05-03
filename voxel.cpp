@@ -7,6 +7,7 @@
 #include "VoxelStaging.h"
 #include "D3D12ResourceUtils.h"
 #include "VoxelUploadCopies.h"
+#include "ChunkStreaming.h"
 
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -69,27 +70,6 @@ static_assert(sizeof(FrameConstants) <= CB_ALIGN);
 //  Chunk data structures (file-local)
 // ===================================================================
 namespace {
-
-    // ---- chunk manager state ----
-    struct ChunkMgr {
-        std::unordered_map<int64_t, Chunk> chunks;
-        int centerRX = INT_MIN, centerRZ = INT_MIN;
-        int64_t slotKeys[LOAD_CHUNKS][LOAD_CHUNKS];
-
-        std::deque<std::pair<int, int>> uploadQueue;
-
-        // Split clear path:
-        //   occClearQueue   – tiny 1×8×1 occupancy columns, drained fully every frame
-        //   atlasClearQueue – 32×128×32 voxel blocks, amortised over several frames
-        std::deque<std::pair<int, int>> occClearQueue;
-        std::deque<std::pair<int, int>> atlasClearQueue;
-
-        void init() {
-            centerRX = centerRZ = INT_MIN;
-            for (auto& row : slotKeys)
-                for (auto& k : row) k = INT64_MIN;
-        }
-    } cm;
 
     // =================================================================
     //  Background terrain-generation worker pool
@@ -224,15 +204,6 @@ static uint8_t SurfaceHeightAt(float wx, float wz) {
 // ===================================================================
 //  Chunk streaming – determine which chunks to load/unload
 // ===================================================================
-static constexpr int REGION_BLOCK_SHIFT = 8;   // log2(REGION_CHUNKS * CHUNK_X) = log2(256)
-
-static int BlockToRegion(int b) { return b >> REGION_BLOCK_SHIFT; }
-
-static bool RegionInBounds(int rx, int rz, int cRX, int cRZ) {
-    return rx >= cRX - 1 && rx <= cRX + 1 &&
-        rz >= cRZ - 1 && rz <= cRZ + 1;
-}
-
 static void EvictRegion(int rx, int rz) {
     int cxMin = rx * REGION_CHUNKS, czMin = rz * REGION_CHUNKS;
     for (int cx = cxMin; cx < cxMin + REGION_CHUNKS; ++cx)
