@@ -103,48 +103,6 @@ static struct GpuState {
 } gpu;
 
 // ===================================================================
-//  GenerateTerrain – called from Demo.cpp before InitD3D12
-// ===================================================================
-void GenerateTerrain() {
-    cm.init();
-    StartGenWorkers(GEN_WORKER_COUNT);
-
-    int prx = BlockToRegion(int(std::floor(gApp.camX)));
-    int prz = BlockToRegion(int(std::floor(gApp.camY)));
-    cm.centerRX = prx;
-    cm.centerRZ = prz;
-
-    // Enqueue all 576 chunks to the worker pool.
-    std::vector<GenJob> jobs;
-    const uint32_t e = gen.epoch.load(std::memory_order_relaxed);
-    for (int rx = prx - 1; rx <= prx + 1; ++rx)
-        for (int rz = prz - 1; rz <= prz + 1; ++rz) {
-            int cxMin = rx * REGION_CHUNKS, czMin = rz * REGION_CHUNKS;
-            for (int cx = cxMin; cx < cxMin + REGION_CHUNKS; ++cx)
-                for (int cz = czMin; cz < czMin + REGION_CHUNKS; ++cz) {
-                    gen.pending.insert(ChunkKey(cx, cz));
-                    jobs.push_back({ cx, cz, e });
-                }
-        }
-    {
-        std::lock_guard<std::mutex> lk(gen.mtx);
-        for (auto& j : jobs) gen.jobs.push_back(j);
-    }
-    gen.cv.notify_all();
-
-    // Block until every chunk has been generated AND handed back.
-    // Main thread does no noise work – it only drains the completion queue.
-    while (!gen.pending.empty()) {
-        ProcessGenResults();
-        if (!gen.pending.empty())
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-
-    float sh = float(SurfaceHeightAt(gApp.camX, gApp.camY));
-    gApp.camZ = sh + 2.5f;
-}
-
-// ===================================================================
 //  D3D12 utilities
 // ===================================================================
 static void WaitForGpu() {
