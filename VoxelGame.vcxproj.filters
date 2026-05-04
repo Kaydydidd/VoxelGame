@@ -5,9 +5,6 @@
       <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
       <Extensions>cpp;c;cc;cxx;c++;cppm;ixx;def;odl;idl;hpj;bat;asm;asmx</Extensions>
     </Filter>
-    <Filter Include="Src\Shaders">
-      <UniqueIdentifier>{993b294c-55bb-4910-9410-8a6150c3a084}</UniqueIdentifier>
-    </Filter>
     <Filter Include="Src\Camera and Window">
       <UniqueIdentifier>{4ffec030-a731-4a66-9d24-87d096834799}</UniqueIdentifier>
     </Filter>
@@ -16,9 +13,6 @@
     </Filter>
     <Filter Include="Src\World">
       <UniqueIdentifier>{073f7b5e-4bde-4ceb-8b9f-02f86db1f1bc}</UniqueIdentifier>
-    </Filter>
-    <Filter Include="Src\World\Noise">
-      <UniqueIdentifier>{c5fc1383-ad49-4d0b-9827-991d80d66029}</UniqueIdentifier>
     </Filter>
     <Filter Include="Src\World\Chunking">
       <UniqueIdentifier>{b1776911-98b5-4e26-8998-83f1a3fc8e4d}</UniqueIdentifier>
@@ -29,10 +23,16 @@
     <Filter Include="Src\Rendering\D3D12">
       <UniqueIdentifier>{2469917a-d344-4fc0-b016-b3046e5ef1aa}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Src\Rendering\Shaders">
+      <UniqueIdentifier>{993b294c-55bb-4910-9410-8a6150c3a084}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Src\World\Terrain">
+      <UniqueIdentifier>{c5fc1383-ad49-4d0b-9827-991d80d66029}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="VoxelShader.cpp">
-      <Filter>Src\Shaders</Filter>
+      <Filter>Src\Rendering\Shaders</Filter>
     </ClCompile>
     <ClCompile Include="InputCamera.cpp">
       <Filter>Src\Camera and Window</Filter>
@@ -50,10 +50,7 @@
       <Filter>Src\Main</Filter>
     </ClCompile>
     <ClCompile Include="TerrainNoise.cpp">
-      <Filter>Src\World\Noise</Filter>
-    </ClCompile>
-    <ClCompile Include="TerrainGen.cpp">
-      <Filter>Src\World\Chunking</Filter>
+      <Filter>Src\World\Terrain</Filter>
     </ClCompile>
     <ClCompile Include="VoxelStaging.cpp">
       <Filter>Src\World\Chunking</Filter>
@@ -67,25 +64,25 @@
     <ClCompile Include="VoxelUploadCopies.cpp">
       <Filter>Src\Rendering\D3D12</Filter>
     </ClCompile>
-    <ClCompile Include="VoxelWorld.cpp">
-      <Filter>Src\World\Chunking</Filter>
-    </ClCompile>
     <ClCompile Include="ChunkStreaming.cpp">
       <Filter>Src\World\Chunking</Filter>
+    </ClCompile>
+    <ClCompile Include="TerrainGen.cpp">
+      <Filter>Src\World\Terrain</Filter>
+    </ClCompile>
+    <ClCompile Include="VoxelWorld.cpp">
+      <Filter>Src\World</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="VoxelShader.h">
-      <Filter>Src\Shaders</Filter>
+      <Filter>Src\Rendering\Shaders</Filter>
     </ClInclude>
     <ClInclude Include="voxel.h">
       <Filter>Src\Main</Filter>
     </ClInclude>
     <ClInclude Include="TerrainNoise.h">
-      <Filter>Src\World\Noise</Filter>
-    </ClInclude>
-    <ClInclude Include="TerrainGen.h">
-      <Filter>Src\World\Chunking</Filter>
+      <Filter>Src\World\Terrain</Filter>
     </ClInclude>
     <ClInclude Include="VoxelStaging.h">
       <Filter>Src\World\Chunking</Filter>
@@ -93,11 +90,14 @@
     <ClInclude Include="VoxelUploadCopies.h">
       <Filter>Src\Rendering\D3D12</Filter>
     </ClInclude>
-    <ClInclude Include="VoxelWorld.h">
-      <Filter>Src\World\Chunking</Filter>
-    </ClInclude>
     <ClInclude Include="ChunkStreaming.h">
       <Filter>Src\World\Chunking</Filter>
+    </ClInclude>
+    <ClInclude Include="TerrainGen.h">
+      <Filter>Src\World\Terrain</Filter>
+    </ClInclude>
+    <ClInclude Include="VoxelWorld.h">
+      <Filter>Src\World</Filter>
     </ClInclude>
   </ItemGroup>
 </Project>
