@@ -1,10 +1,6 @@
+// VoxelShader.cpp
 #include "VoxelShader.h"
 
-// ===================================================================
-//  HLSL compute shader – two-level (section / voxel) DDA through
-//  toroidal atlas, using a section-occupancy map to skip empty
-//  32×16×32 regions in a single step.
-// ===================================================================
 const char* g_shaderSrc = R"(
 cbuffer CB : register(b0)
 {
@@ -49,13 +45,11 @@ static const float3 bcolors[9] = {
 };
 static const float faceBri[6] = { 0.80, 0.80, 1.00, 0.45, 0.65, 0.65 };
 
-// Outward surface normal per hit-face index.
 static const float3 faceN[6] = {
     float3( 1, 0, 0), float3(-1, 0, 0),
     float3( 0, 1, 0), float3( 0,-1, 0),
     float3( 0, 0, 1), float3( 0, 0,-1)
 };
-// Deterministic axis-aligned tangent / bitangent per face.
 static const float3 faceT[6] = {
     float3( 0, 0, 1), float3( 0, 0, 1),
     float3( 1, 0, 0), float3( 1, 0, 0),
@@ -67,19 +61,15 @@ static const float3 faceB[6] = {
     float3( 0, 1, 0), float3( 0, 1, 0)
 };
 
-// ---- Ambient-occlusion parameters ----
 static const int   AO_SAMPLES  = 6;
 static const float AO_MAX_DIST = 12.0;
 static const float AO_BIAS     = 0.02;
 static const float AO_STRENGTH = 0.9;
 
-// Directional influence: sun-facing surfaces receive less AO shadowing.
-// Set AO_SUN_INFLUENCE to 0.0 for omnidirectional AO (original behaviour).
-static const float3 AO_SUN_DIR       = float3(0.8305, 0.4983, 0.2491); // morning sun high in east
-static const float  AO_SUN_INFLUENCE = 1.0;   // 0 = omni, 1 = full directional
-static const float  AO_MIN_BRIGHT    = 0.12;  // floor to prevent pure-black backfaces
+static const float3 AO_SUN_DIR       = float3(0.8305, 0.4983, 0.2491);
+static const float  AO_SUN_INFLUENCE = 1.0;
+static const float  AO_MIN_BRIGHT    = 0.12;
 
-// 6 fixed hemisphere directions in tangent space (z = along normal).
 static const float3 AO_DIRS[6] = {
     float3( 0.87543,  0.23457, 0.42262),
     float3(-0.64085,  0.64085, 0.42262),
@@ -146,9 +136,73 @@ float3 BlockColor(uint bt, int face, int3 bp)
     return c * (1.0 + v);
 }
 
+// Slab-method ray–AABB test.
+//   tEnter : forward distance to the entry plane (clamped to >= 0)
+//   tExit  : forward distance to the exit plane
+//   entryAxis : 0/1/2 = X/Y/Z plane that determined tEnter,
+//               or -1 if the ray started inside the box
+bool RayBoxIntersect(float3 ro, float3 rd, float3 bmin, float3 bmax,
+                     out float tEnter, out float tExit, out int entryAxis)
+{
+    float3 invRd = 1.0 / rd;
+    float3 t0    = (bmin - ro) * invRd;
+    float3 t1    = (bmax - ro) * invRd;
+    float3 tNear = min(t0, t1);
+    float3 tFar  = max(t0, t1);
+
+    // Pick the axis that produced tEnter so the caller can derive
+    // the corresponding entry face index.
+    entryAxis = 0;
+    tEnter    = tNear.x;
+    if (tNear.y > tEnter) { tEnter = tNear.y; entryAxis = 1; }
+    if (tNear.z > tEnter) { tEnter = tNear.z; entryAxis = 2; }
+
+    tExit = min(min(tFar.x, tFar.y), tFar.z);
+
+    if (tEnter < 0.0) { tEnter = 0.0; entryAxis = -1; }   // ray started inside
+    return tEnter <= tExit && tExit > 0.0;
+}
+
 bool Trace(float3 ro, float3 rd, float maxT,
            out float outDist, out int outFace, out int3 outVox)
 {
+    outDist = maxT;
+    outFace = -1;
+    outVox  = int3(0, 0, 0);
+
+    float3 wMin = float3(float(loadMinCX) * 32.0, 0.0,        float(loadMinCZ) * 32.0);
+    float3 wMax = float3(float(loadMaxCX) * 32.0, float(CY),  float(loadMaxCZ) * 32.0);
+
+    float tEnter, tExit;
+    int   entryAxis;                                          // <-- NEW
+    if (!RayBoxIntersect(ro, rd, wMin, wMax, tEnter, tExit, entryAxis))
+        return false;
+
+    maxT = min(maxT, tExit);
+    if (tEnter >= maxT) return false;
+
+    // Hoist face declaration so we can seed it with the entry plane
+    // when the ray begins outside the loaded volume. This guarantees
+    // any hit reported by the DDA loop has a valid face index, even
+    // when the very first voxel tested (skipFirst == false) is solid.
+    int   face      = -1;                                     // <-- moved up
+    float tStart    = 0.0;
+    bool  skipFirst = true;
+    if (tEnter > 0.0)
+    {
+        tStart    = tEnter + 1e-4;
+        ro       += rd * tStart;
+        maxT     -= tStart;
+        skipFirst = false;
+        if (maxT <= 0.0) return false;
+
+        // Seed the face with the AABB entry plane. Step direction tells
+        // us which side of the voxel the ray actually struck.
+        if      (entryAxis == 0) face = (rd.x > 0.0) ? 1 : 0;  // -X / +X
+        else if (entryAxis == 1) face = (rd.y > 0.0) ? 3 : 2;  // -Y / +Y
+        else                     face = (rd.z > 0.0) ? 5 : 4;  // -Z / +Z
+    }
+
     int3   st = int3(rd.x>=0?1:-1, rd.y>=0?1:-1, rd.z>=0?1:-1);
     float3 tD = abs(1.0/rd);
 
@@ -160,10 +214,9 @@ bool Trace(float3 ro, float3 rd, float maxT,
     float3 tMC = InitTMax(sc, SEC_F, ro, st, tD);
 
     float dist = 0.0;
-    int   face = -1;
+    // int face = -1;                <-- REMOVED (declared above)
     bool  hit  = false;
     bool  fineValid = true;
-    bool  skipFirst = true;
 
     [loop] for (int ci = 0; ci < MAX_COARSE; ++ci)
     {
@@ -221,7 +274,7 @@ bool Trace(float3 ro, float3 rd, float maxT,
         }
     }
 
-    outDist = dist;
+    outDist = dist + tStart;   // convert back to original ray-origin space
     outFace = face;
     outVox  = mp;
     return hit;
@@ -245,7 +298,6 @@ void CSMain(uint3 tid : SV_DispatchThreadID)
         uint bt = GetBlock(mp);
         float3 c = BlockColor(bt, face, mp) * faceBri[face];
 
-        // ---- World-space ambient occlusion (6 fixed secondary rays) ----
         float3 N = faceN[face];
         float3 T = faceT[face];
         float3 B = faceB[face];
@@ -263,9 +315,8 @@ void CSMain(uint3 tid : SV_DispatchThreadID)
         }
         float ao = 1.0 - occ / float(AO_SAMPLES);
 
-        // ---- Directional AO modulation: sun-facing surfaces receive less AO ----
         float NdotL = dot(N, AO_SUN_DIR);
-        float sunFacing = saturate(0.5 - 0.5 * NdotL);     // 0 = facing sun, 1 = away
+        float sunFacing = saturate(0.5 - 0.5 * NdotL);
         float dirMod = lerp(1.0, sunFacing, AO_SUN_INFLUENCE);
         float effStrength = AO_STRENGTH * dirMod;
         c *= max(AO_MIN_BRIGHT, (1.0 - effStrength) + effStrength * ao);
